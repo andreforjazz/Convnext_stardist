@@ -1,0 +1,56 @@
+[build-system]
+requires = ["setuptools>=42", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "CODA_HE_nucleus_segmentation"
+version = "0.1"
+description = "Python version of some pieces of the original CODA MATLAB codebase"
+requires-python = "=3.9"
+authors = [
+    { name = "André Forjaz" }
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent"
+]
+#dependencies = [
+#    "numpy>=2.2.2",
+#    "opencv-python>=4.11.0.86",
+#    "openslide-python>=1.4.1",
+#    "scikit-image>=0.25.0",
+#    "scipy>=1.15.1",
+#    "tqdm>=4.67.1"
+#]
+dependencies = [
+    "tensorflow<2.11",
+    "stardist",
+    "imagecodecs",
+    "jupyter",
+    "opencv-python",
+    "openslide-python",
+    "gputil",
+    "pandas",
+    "chardet",
+    "geojson",
+    "numpy==1.24.4",
+    "matplotlib",
+    "seaborn",
+    "shapely",
+    "geopandas",
+    "tifffile",
+    "Pillow",
+    "scikit-learn",
+    "gc"
+]
+
+
+[project.readme]
+file = "README.md"
+content-type = "text/markdown"
+
+#[project.scripts]
+#downsample = "pycoda.downsampler:Downsampler.run_from_command_line"
+#tissuemasking = "pycoda.tissue_masking:TissueMasking.run_from_command_line"
+#registration = "pycoda.registration.calculate_image_registration:main"

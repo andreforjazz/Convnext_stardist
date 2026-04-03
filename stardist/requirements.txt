@@ -1,0 +1,15 @@
+#pip install -r requirements.txt
+tensorflow<2.11
+stardist
+imagecodecs
+jupyter
+opencv-python
+openslide-python
+openslide-bin
+gputil
+#tensorflow-gpu
+pandas
+chardet
+jupyter
+geojson
+numpy==1.24.4

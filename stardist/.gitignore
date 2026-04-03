@@ -1,0 +1,4 @@
+# TensorFlow event logs (too large for GitHub)
+models/**/logs/**/*.v2
+models/**/logs/**/events.out.tfevents.*
+models/**/logs/**/training_log.*
