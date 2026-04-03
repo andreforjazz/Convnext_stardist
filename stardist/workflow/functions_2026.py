@@ -38,6 +38,56 @@ else:
     import openslide
 # import openslide
 
+
+def read_image_array(path: str) -> np.ndarray:
+    """Load H&E-style image as (H, W, C) float-ready uint8. TIFF via tifffile; PNG/JPEG/WebP/etc. via PIL."""
+    ext = os.path.splitext(path)[1].lower()
+    if ext in ('.tif', '.tiff'):
+        arr = imread(path)
+    else:
+        with Image.open(path) as pil_img:
+            if pil_img.mode == 'RGBA':
+                pil_img = pil_img.convert('RGB')
+            elif pil_img.mode != 'RGB':
+                pil_img = pil_img.convert('RGB')
+            arr = np.asarray(pil_img)
+    if arr.ndim == 2:
+        arr = np.stack([arr, arr, arr], axis=-1)
+    elif arr.ndim == 3 and arr.shape[-1] == 1:
+        arr = np.concatenate([arr, arr, arr], axis=-1)
+    elif arr.shape[-1] == 4:
+        arr = arr[..., :3]
+    return arr
+
+
+def read_mask_array(path: str) -> np.ndarray:
+    """Load label/mask image; TIFF via tifffile, other formats via PIL (no channel forcing)."""
+    ext = os.path.splitext(path)[1].lower()
+    if ext in ('.tif', '.tiff'):
+        return imread(path)
+    with Image.open(path) as pil_img:
+        return np.asarray(pil_img)
+
+
+# predict_instances_big() is for WSIs; it always configures 4096 blocks and passes n_tiles=(4,4,1) into
+# each block's predict_instances — severe overhead on ~256px patches. Use direct predict below this size.
+_STARDIST_USE_BIG_PREDICT_THRESHOLD = 4096
+
+
+def _stardist_max_spatial_side(img: np.ndarray) -> int:
+    return int(max(img.shape[0], img.shape[1]))
+
+
+def _stardist_use_predict_big(img: np.ndarray) -> bool:
+    return _stardist_max_spatial_side(img) > _STARDIST_USE_BIG_PREDICT_THRESHOLD
+
+
+def _maybe_clear_keras_session_after_big(img: np.ndarray) -> None:
+    if _stardist_use_predict_big(img):
+        tf.keras.backend.clear_session()
+        gc.collect()
+
+
 def extract_and_save_pixel_sizes(pth_WSI_ndpi, output_folder):
     """
     Extracts pixel sizes from NDPI files and saves them in .mat files.
@@ -144,7 +194,7 @@ def read_tiles(tiles_pth: str) -> List[np.ndarray]:
     """Read .tif tile files from pth and return list of image matrices"""
     tiles_full_pth = [os.path.join(tiles_pth, tile) for tile in os.listdir(tiles_pth) if
                       tile.endswith(('.tif', '.png'))]
-    tiles = [imread(tile_pth) for tile_pth in tiles_full_pth]
+    tiles = [read_image_array(tile_pth) for tile_pth in tiles_full_pth]
     return tiles
 
 
@@ -158,7 +208,7 @@ def read_masks(masks_pth: str) -> List[np.ndarray]:
     masks_fixed = []
     for i, tile_pth in enumerate(tiles_full_pth):
         try:
-            masks_fixed.append(imread(tile_pth))
+            masks_fixed.append(read_mask_array(tile_pth))
         except:
             print(f'problem reading mask {i}: {tile_pth}')
 
@@ -209,7 +259,7 @@ def save_geojson_from_segmentation(tiles_pth: str, model: StarDist2D, outpth: st
     for cc in range(len(tiles)):
         name = tiles[cc]
         tile_pth = os.path.join(tiles_pth, name)
-        tile = imread(tile_pth)
+        tile = read_image_array(tile_pth)
 
         tile = tile / 255
 
@@ -742,41 +792,43 @@ def segment_and_save_JSONs(WSIs, model, out_pth_json, out_pth_tif=None,inverse=0
                 print(f'\nStarting {nm} ({idx}/{total_images})')
 
                 # Read and normalize image
-                img = imread(img_pth)
+                img = read_image_array(img_pth)
                 img = img / 255  # normalization used to train model
 
-                try: # Predict instances
-                    _, polys = model.predict_instances_big(
-                        img,
-                        axes='YXC',
-                        block_size=4096,
-                        min_overlap=128,
-                        context=128,
-                        n_tiles=(4, 4, 1)
+                if not _stardist_use_predict_big(img):
+                    n_tiles = model._guess_n_tiles(img)
+                    _, polys = model.predict_instances(
+                        img, axes='YXC', n_tiles=n_tiles, show_tile_progress=False
                     )
-                except:
-                    _, polys = model.predict_instances_big(
-                        img,
-                        axes='YXC',
-                        block_size=2048,
-                        min_overlap=128,
-                        context=128,
-                        n_tiles=(4, 4, 1)
-                    )
-
+                else:
+                    try:
+                        _, polys = model.predict_instances_big(
+                            img,
+                            axes='YXC',
+                            block_size=4096,
+                            min_overlap=128,
+                            context=128,
+                            n_tiles=(4, 4, 1),
+                        )
+                    except Exception:
+                        _, polys = model.predict_instances_big(
+                            img,
+                            axes='YXC',
+                            block_size=2048,
+                            min_overlap=128,
+                            context=128,
+                            n_tiles=(4, 4, 1),
+                        )
 
                 # Save results
                 print('Saving json...')
                 save_json_from_WSI_pred(polys, out_pth_json, nm)
 
-                # Clear GPU memory
-                tf.keras.backend.clear_session()
-                gc.collect()
+                _maybe_clear_keras_session_after_big(img)
             else:
                 print(f'Skipping {nm} ({idx}/{total_images})')
         except Exception as e:
-            print(f'Skipping {img_pth} ({idx}/{total_images}), probably because it\'s too big... Error: {e}')
-            # Clear GPU memory in case of exception
+            print(f'Skipping {img_pth} ({idx}/{total_images}). Error: {e}')
             tf.keras.backend.clear_session()
             gc.collect()
 
@@ -817,18 +869,23 @@ def segment_and_save_JSONs_and_masks(WSIs, model, out_pth_json, out_pth_tif, out
                 print(f'\nStarting {nm} ({idx}/{total_images})')
 
                 # Read and normalize image
-                img = imread(img_pth)
+                img = read_image_array(img_pth)
                 img = img / 255  # normalization used to train model
 
-                # Predict instances
-                mask, polys = model.predict_instances_big(
-                    img,
-                    axes='YXC',
-                    block_size=4096,
-                    min_overlap=128,
-                    context=128,
-                    n_tiles=(4, 4, 1)
-                )
+                if not _stardist_use_predict_big(img):
+                    n_tiles = model._guess_n_tiles(img)
+                    mask, polys = model.predict_instances(
+                        img, axes='YXC', n_tiles=n_tiles, show_tile_progress=False
+                    )
+                else:
+                    mask, polys = model.predict_instances_big(
+                        img,
+                        axes='YXC',
+                        block_size=4096,
+                        min_overlap=128,
+                        context=128,
+                        n_tiles=(4, 4, 1),
+                    )
 
                 # Save results
                 print('Saving json...')
@@ -857,14 +914,11 @@ def segment_and_save_JSONs_and_masks(WSIs, model, out_pth_json, out_pth_tif, out
                     tif_output_path = os.path.join(out_pth_tif, nm + '.tif')
                     imwrite(tif_output_path, resized_mask.astype(np.uint32))
 
-                # Clear GPU memory
-                tf.keras.backend.clear_session()
-                gc.collect()
+                _maybe_clear_keras_session_after_big(img)
             else:
                 print(f'Skipping {nm} ({idx}/{total_images})')
         except Exception as e:
-            print(f'Skipping {img_pth} ({idx}/{total_images}), probably because it\'s too big... Error: {e}')
-            # Clear GPU memory in case of exception
+            print(f'Skipping {img_pth} ({idx}/{total_images}). Error: {e}')
             tf.keras.backend.clear_session()
             gc.collect()
 
@@ -904,29 +958,41 @@ def segment_and_save_JSONs_prob_maps(WSIs, model, out_pth_json, out_pth_prob, in
             if not os.path.exists(json_output_path):
                 print(f'\nStarting {nm} ({idx}/{total_images})')
 
-                img = imread(img_pth)
+                img = read_image_array(img_pth)
                 img = img / 255
 
-                try:
-                    _, polys, (prob, _) = model.predict_instances_big(
+                if not _stardist_use_predict_big(img):
+                    n_tiles = model._guess_n_tiles(img)
+                    (_labels, polys), pred_tuple = model.predict_instances(
                         img,
                         axes='YXC',
-                        block_size=4096,
-                        min_overlap=128,
-                        context=128,
-                        n_tiles=(4, 4, 1),
-                        return_predict=True
+                        n_tiles=n_tiles,
+                        show_tile_progress=False,
+                        return_predict=True,
                     )
-                except:
-                    _, polys, (prob, _) = model.predict_instances_big(
-                        img,
-                        axes='YXC',
-                        block_size=2048,
-                        min_overlap=128,
-                        context=128,
-                        n_tiles=(4, 4, 1),
-                        return_predict=True
-                    )
+                    prob = pred_tuple[0]
+                else:
+                    try:
+                        _, polys, pred_tuple = model.predict_instances_big(
+                            img,
+                            axes='YXC',
+                            block_size=4096,
+                            min_overlap=128,
+                            context=128,
+                            n_tiles=(4, 4, 1),
+                            return_predict=True,
+                        )
+                    except Exception:
+                        _, polys, pred_tuple = model.predict_instances_big(
+                            img,
+                            axes='YXC',
+                            block_size=2048,
+                            min_overlap=128,
+                            context=128,
+                            n_tiles=(4, 4, 1),
+                            return_predict=True,
+                        )
+                    prob = pred_tuple[0]
 
                 print('Saving json...')
                 save_json_from_WSI_pred(polys, out_pth_json, nm)
@@ -935,12 +1001,11 @@ def segment_and_save_JSONs_prob_maps(WSIs, model, out_pth_json, out_pth_prob, in
                 prob_output_path = os.path.join(out_pth_prob, nm + '_prob.tif')
                 imwrite(prob_output_path, prob.astype(np.float32))
 
-                tf.keras.backend.clear_session()
-                gc.collect()
+                _maybe_clear_keras_session_after_big(img)
             else:
                 print(f'Skipping {nm} ({idx}/{total_images})')
         except Exception as e:
-            print(f'Skipping {img_pth} ({idx}/{total_images}), probably because it\'s too big... Error: {e}')
+            print(f'Skipping {img_pth} ({idx}/{total_images}). Error: {e}')
             tf.keras.backend.clear_session()
             gc.collect()
 

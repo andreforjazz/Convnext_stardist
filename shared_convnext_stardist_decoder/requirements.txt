@@ -1,0 +1,12 @@
+# PyTorch: install for your CUDA/CPU (example below is generic).
+# pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
+torch>=2.0
+timm>=0.9.16
+numpy>=1.24
+scipy>=1.10
+scikit-image>=0.21
+PyYAML>=6.0
+tqdm>=4.65
+Pillow>=10.0
+opencv-python>=4.8
+tifffile>=2023.1
