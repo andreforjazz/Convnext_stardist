@@ -1,8 +1,13 @@
-# PyTorch: install for your CUDA/CPU (example below is generic).
-# pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
+# Fast path (recommended): minimal conda + pip — see environment_gs40_multitask.yaml
+#
+# All-pip (GPU cu118): install torch first, then the rest:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
+#   pip install -r requirements_after_torch.txt
+#
 torch>=2.0
 timm>=0.9.16
-numpy>=1.24
+numpy>=1.26
+pandas>=2.0
 scipy>=1.10
 scikit-image>=0.21
 PyYAML>=6.0

@@ -50,7 +50,7 @@ def main() -> None:
     if not cn and class_to_idx and len(class_to_idx) != n_cls:
         raise ValueError("model.num_classes must match scanned inst2class names when class_names is omitted")
 
-    out_dir = Path(ckpt_cfg["out_dir"])
+    out_dir = Path(ckpt_cfg["out_dir"]) / cfg.get("experiment_name", "experiment_run")
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "config_resolved.yaml").write_text(yaml.safe_dump(cfg), encoding="utf-8")
     idx2label = {i: n for n, i in class_to_idx.items()} if class_to_idx else {}
@@ -66,12 +66,15 @@ def main() -> None:
         print(f"Loaded weights from {args.resume}")
 
     ps = int(tr_cfg["patch_size"])
+    cache_to_ram = bool(data.get("cache_to_ram", False))
     train_ds = StardistMultitaskTileDataset(
         Path(data["train_images_dir"]),
         Path(data["train_labels_dir"]),
         n_rays=int(m_cfg["n_rays"]),
         patch_size=ps,
         class_to_idx=class_to_idx if class_to_idx else None,
+        stems=data.get("train_stems"),
+        cache_to_ram=cache_to_ram,
     )
     val_ds = StardistMultitaskTileDataset(
         Path(data["val_images_dir"]),
@@ -79,6 +82,8 @@ def main() -> None:
         n_rays=int(m_cfg["n_rays"]),
         patch_size=ps,
         class_to_idx=class_to_idx if class_to_idx else None,
+        stems=data.get("val_stems"),
+        cache_to_ram=cache_to_ram,
     )
 
     train_loader = DataLoader(
@@ -138,6 +143,11 @@ def main() -> None:
                 )
 
             scaler.scale(loss).backward()
+            
+            # Unscale gradients before clipping to prevent NaN explosion
+            scaler.unscale_(opt)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            
             scaler.step(opt)
             scaler.update()
             pbar.set_postfix(loss=f'{parts["loss"]:.4f}', bce=f'{parts["bce"]:.4f}', cls=f'{parts["cls"]:.4f}')

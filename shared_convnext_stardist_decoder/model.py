@@ -3,7 +3,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import timm
+from transformers import AutoModel
 
 
 class ConvBlock(nn.Module):
@@ -32,7 +32,7 @@ class StardistMultitaskNet(nn.Module):
 
     def __init__(
         self,
-        backbone_name: str = "convnextv2_tiny.fcmae_ft_in22k_in1k_224",
+        backbone_name: str = "convnextv2_tiny.fcmae_ft_in22k_in1k",
         *,
         pretrained: bool = True,
         n_rays: int = 32,
@@ -43,13 +43,13 @@ class StardistMultitaskNet(nn.Module):
         self.n_rays = int(n_rays)
         self.num_classes = int(num_classes)
 
-        self.backbone = timm.create_model(
+        self.backbone = AutoModel.from_pretrained(
             backbone_name,
-            pretrained=pretrained,
-            features_only=True,
-            out_indices=(0, 1, 2, 3),
+            use_safetensors=True
         )
-        ch = self.backbone.feature_info.channels()
+        
+        # In ConvNeXt V2 Tiny, stage channel sizes are standard:
+        ch = [96, 192, 384, 768]
         dc = int(decoder_channels)
 
         self.bridge = ConvBlock(ch[3], dc)
@@ -69,7 +69,11 @@ class StardistMultitaskNet(nn.Module):
         self.head_cls = nn.Conv2d(dc, self.num_classes, 1)
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        feats = self.backbone(x)
+        outputs = self.backbone(x, output_hidden_states=True)
+        # HF ConvNeXt V2 returns 5 hidden states: [embedding, stage1, stage2, stage3, stage4]
+        # We drop the first one to get the 4 stages.
+        feats = outputs.hidden_states[1:]
+        
         t = self.bridge(feats[3])
         t = self.up3(t)
         t = torch.cat([t, feats[2]], dim=1)
@@ -95,7 +99,7 @@ class StardistMultitaskNet(nn.Module):
 def build_model(cfg: dict) -> StardistMultitaskNet:
     m = cfg.get("model", cfg)
     return StardistMultitaskNet(
-        backbone_name=str(m.get("backbone", "convnextv2_tiny.fcmae_ft_in22k_in1k_224")),
+        backbone_name=str(m.get("backbone", "facebook/convnextv2-tiny-22k-224")),
         pretrained=bool(m.get("pretrained", True)),
         n_rays=int(m.get("n_rays", 32)),
         num_classes=int(m.get("num_classes", 8)),

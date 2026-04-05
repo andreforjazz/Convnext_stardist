@@ -1,0 +1,12 @@
+# Use after: pip install torch torchvision ... (see environment_gs40_multitask.yaml)
+transformers>=4.30
+huggingface_hub
+numpy>=1.26
+pandas>=2.0
+scipy>=1.10
+scikit-image>=0.21
+PyYAML>=6.0
+tqdm>=4.65
+Pillow>=10.0
+opencv-python>=4.8
+tifffile>=2023.1

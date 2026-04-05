@@ -35,7 +35,6 @@ class StardistMultitaskTileDataset(Dataset):
     Optional sidecar `{stem}_inst2class.json`:
         {"1": "liver", "2": "heart"}
     Class indices are 0..K-1 from alphabetically sorted unique names across the dataset
-    (pass `class_to_idx` from training script after scanning).
     """
 
     def __init__(
@@ -47,6 +46,8 @@ class StardistMultitaskTileDataset(Dataset):
         patch_size: int | None = None,
         class_to_idx: dict[str, int] | None = None,
         extensions: tuple[str, ...] = (".png", ".jpg", ".jpeg", ".tif", ".tiff"),
+        stems: list[str] | None = None,
+        cache_to_ram: bool = False,
     ) -> None:
         super().__init__()
         self.images_dir = Path(images_dir)
@@ -54,12 +55,33 @@ class StardistMultitaskTileDataset(Dataset):
         self.n_rays = int(n_rays)
         self.patch_size = patch_size
         self.class_to_idx = class_to_idx or {}
+        self.cache_to_ram = cache_to_ram
+        self.ram_cache = {}
 
         self.image_paths: list[Path] = []
-        for ext in extensions:
-            self.image_paths.extend(sorted(self.images_dir.glob(f"*{ext}")))
+        if stems:
+            stems_set = set(stems)
+            # Find images for the given stems
+            for ext in extensions:
+                for p in self.images_dir.glob(f"*{ext}"):
+                    if p.stem in stems_set:
+                        self.image_paths.append(p)
+            self.image_paths.sort(key=lambda x: x.stem)
+        else:
+            for ext in extensions:
+                self.image_paths.extend(sorted(self.images_dir.glob(f"*{ext}")))
+
         if not self.image_paths:
-            raise RuntimeError(f"No images in {self.images_dir}")
+            msg = f"No images in {self.images_dir}"
+            if stems:
+                msg += f" matching {len(stems)} stems"
+            raise RuntimeError(msg)
+
+        if self.cache_to_ram:
+            print(f"Loading {len(self.image_paths)} samples to RAM. Depending on size, this may take a few minutes...")
+            from tqdm import tqdm
+            for idx in tqdm(range(len(self.image_paths)), desc="Caching to RAM"):
+                self.ram_cache[idx] = self._load_item(idx)
 
     def _find_label_path(self, img_path: Path) -> Path:
         stem = img_path.stem
@@ -67,43 +89,94 @@ class StardistMultitaskTileDataset(Dataset):
             cand = self.labels_dir / f"{stem}{ext}"
             if cand.is_file():
                 return cand
-        raise FileNotFoundError(f"No label for {img_path.name} in {self.labels_dir}")
+        return None  # Return None if no mask is found
 
+    # def _load_inst2class(self, stem: str) -> dict[int, int] | None:
+        # if not self.class_to_idx:
+        #     return None
+        # p = self.labels_dir / f"{stem}_inst2class.json"
+        # if not p.is_file():
+        #     return None
+        # raw = json.loads(p.read_text(encoding="utf-8"))
+        # out: dict[int, int] = {}
+        # for k, name in raw.items():
+        #     name = str(name).strip().lower()
+        #     if name not in self.class_to_idx:
+        #         continue
+        #     out[int(k)] = int(self.class_to_idx[name])
+        # return out if out else None
     def _load_inst2class(self, stem: str) -> dict[int, int] | None:
         if not self.class_to_idx:
             return None
         p = self.labels_dir / f"{stem}_inst2class.json"
         if not p.is_file():
             return None
-        raw = json.loads(p.read_text(encoding="utf-8"))
+        try:
+            txt = p.read_text(encoding="utf-8").strip()
+            if not txt:
+                return None
+            raw = json.loads(txt)
+        except Exception as e:
+            # Log once per file and skip
+            print(f"Warning: bad inst2class JSON for {stem}: {e}")
+            return None
         out: dict[int, int] = {}
-        for k, name in raw.items():
-            name = str(name).strip().lower()
-            if name not in self.class_to_idx:
-                continue
-            out[int(k)] = int(self.class_to_idx[name])
+        for k, name_or_id in raw.items():
+            # Accept either class names or integer ids in the JSON
+            try:
+                # If value is a class id
+                cls_idx = int(name_or_id)
+            except (ValueError, TypeError):
+                # Otherwise treat as name and map via class_to_idx
+                name = str(name_or_id).strip().lower()
+                if name not in self.class_to_idx:
+                    continue
+                cls_idx = int(self.class_to_idx[name])
+            out[int(k)] = cls_idx
         return out if out else None
 
     def __len__(self) -> int:
         return len(self.image_paths)
 
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
+        if self.cache_to_ram:
+            return self.ram_cache[idx]
+        return self._load_item(idx)
+
+    def _load_item(self, idx: int) -> dict[str, torch.Tensor]:
         img_path = self.image_paths[idx]
         lab_path = self._find_label_path(img_path)
         stem = img_path.stem
 
         img = Image.open(img_path).convert("RGB")
-        inst = _load_instance_map(lab_path)
-        if inst.ndim != 2:
-            inst = inst.squeeze()
+        
+        if lab_path is None:
+            # If no mask was found, assume the patch is empty (no cells)
+            inst = np.zeros((img.height, img.width), dtype=np.int32)
+        else:
+            try:
+                inst = _load_instance_map(lab_path)
+                if inst is None or inst.size == 0:
+                    inst = np.zeros((img.height, img.width), dtype=np.int32)
+                elif inst.ndim != 2:
+                    inst = inst.squeeze()
+            except Exception as e:
+                # If tiff is corrupt or empty (no pages, etc)
+                print(f"Warning: Failed to load mask {lab_path}: {e}")
+                inst = np.zeros((img.height, img.width), dtype=np.int32)
+
         ps = int(self.patch_size) if self.patch_size else None
-        if ps is not None:
+        if ps is not None and (img.width != ps or img.height != ps):
             import cv2
 
             img = img.resize((ps, ps), Image.BILINEAR)
-            inst = cv2.resize(
-                inst.astype(np.float32), (ps, ps), interpolation=cv2.INTER_NEAREST
-            ).astype(np.int32)
+            # Ensure inst is at least a 2D array with valid dimensions before resize
+            if inst.ndim >= 2 and inst.shape[0] > 0 and inst.shape[1] > 0:
+                inst = cv2.resize(
+                    inst.astype(np.float32), (ps, ps), interpolation=cv2.INTER_NEAREST
+                ).astype(np.int32)
+            else:
+                inst = np.zeros((ps, ps), dtype=np.int32)
 
         arr = np.asarray(img, dtype=np.float32) / 255.0
 

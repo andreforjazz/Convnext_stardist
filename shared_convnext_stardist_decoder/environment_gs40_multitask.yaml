@@ -1,0 +1,17 @@
+# Fast setup: only Python + pip via conda-forge (seconds). Then install PyTorch + deps with pip.
+#
+#   conda env create -f shared_convnext_stardist_decoder/environment_gs40_multitask.yaml
+#   conda activate convnext_stardist_mt
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
+#   pip install -r shared_convnext_stardist_decoder/requirements_after_torch.txt
+#
+# CPU: omit the PyTorch line and use: pip install torch torchvision
+#
+# CUDA 12.1 wheels: https://download.pytorch.org/whl/cu121
+
+name: convnext_stardist_mt
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
