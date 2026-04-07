@@ -35,7 +35,8 @@ def multitask_loss(
     if (cls_tgt >= 0).any():
         cls_loss = F.cross_entropy(cls_logit, cls_tgt, ignore_index=-100, reduction="mean")
     else:
-        cls_loss = cls_logit.sum() * 0.0
+        # No supervised class pixels in this batch — CE is skipped (cls head gets no grad from cls_loss).
+        cls_loss = torch.zeros((), device=cls_logit.device, dtype=cls_logit.dtype)
 
     total = w_prob * bce + w_dist * dist_loss + w_cls * cls_loss
     parts = {
