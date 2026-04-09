@@ -923,6 +923,110 @@ def segment_and_save_JSONs_and_masks(WSIs, model, out_pth_json, out_pth_tif, out
             gc.collect()
 
 
+def segment_and_save_JSONs_prob_maps_batched(
+    WSIs, model, out_pth_json, out_pth_prob,
+    inverse=0, step_seg=1, batch_size=None, n_io_workers=8
+) -> None:
+    """
+    Load all pending tiles into RAM, then run StarDist one tile at a time.
+
+    Uses ``model.predict_instances(..., return_predict=True)`` per tile — the
+    same path as ``segment_and_save_JSONs_prob_maps``, but reads each tile from
+    a contiguous in-memory array instead of hitting the network for every frame.
+    Avoids ``keras_model.predict_on_batch``, which can take tens of minutes to
+    trace/compile on large ConvNeXt backbones.
+
+    ``batch_size`` is ignored (kept for notebook backward compatibility).
+
+    Args:
+        WSIs: Paths to tile images.
+        model: Loaded StarDist2D model.
+        out_pth_json / out_pth_prob: Output directories.
+        inverse, step_seg: Same as the serial function.
+        n_io_workers: Threads for parallel load and background writes.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+    import time
+
+    if inverse == 1:
+        WSIs = list(reversed(WSIs))
+    WSIs = WSIs[::step_seg]
+
+    pending, skipped = [], 0
+    for img_pth in WSIs:
+        nm = os.path.splitext(os.path.basename(img_pth))[0]
+        if not os.path.exists(os.path.join(out_pth_json, nm + '.json')):
+            pending.append(img_pth)
+        else:
+            skipped += 1
+    if skipped:
+        print(f'Skipping {skipped} already-processed tiles.')
+
+    total = len(pending)
+    if total == 0:
+        print('All tiles already processed.')
+        return
+
+    print(f'Tiles to process : {total}')
+    print(f'Inference        : single-tile predict_instances (in-RAM images)')
+    print(f'I/O workers      : {n_io_workers}')
+
+    def _load(path):
+        return read_image_array(path).astype(np.float32) / 255.0
+
+    def _write(nm, polys, prob):
+        save_json_from_WSI_pred(polys, out_pth_json, nm)
+        imwrite(os.path.join(out_pth_prob, nm + '_prob.tif'),
+                prob.astype(np.float32))
+
+    print(f'\nLoading all {total} tiles into RAM using {n_io_workers} threads...', flush=True)
+    t_load = time.time()
+    with ThreadPoolExecutor(max_workers=n_io_workers) as read_executor:
+        all_imgs_list = list(tqdm(
+            read_executor.map(_load, pending),
+            total=total, unit='tile', desc='Loading'
+        ))
+    load_time = time.time() - t_load
+    print(f'Loaded in {load_time:.1f}s — stacking...', flush=True)
+    all_arr = np.stack(all_imgs_list)
+    del all_imgs_list
+    print(f'Array shape: {all_arr.shape}  ({all_arr.nbytes/1e9:.1f} GB)', flush=True)
+
+    write_executor = ThreadPoolExecutor(max_workers=n_io_workers)
+    write_futures = []
+    t_infer = time.time()
+
+    for i in tqdm(range(total), desc='Segment', unit='tile'):
+        img_pth = pending[i]
+        nm = os.path.splitext(os.path.basename(img_pth))[0]
+        img = all_arr[i]
+        try:
+            (_labels, polys), pred_tuple = model.predict_instances(
+                img,
+                axes='YXC',
+                show_tile_progress=False,
+                return_predict=True,
+            )
+            prob = pred_tuple[0]
+            write_futures.append(write_executor.submit(_write, nm, polys, prob))
+            _maybe_clear_keras_session_after_big(img)
+        except Exception as e:
+            print(f'Skipping {nm}: {e}')
+            tf.keras.backend.clear_session()
+            gc.collect()
+
+    for f in write_futures:
+        try:
+            f.result()
+        except Exception as e:
+            print(f'Write error: {e}')
+    write_executor.shutdown(wait=True)
+
+    infer_s = time.time() - t_infer
+    print(f'\nDone.  {total} tiles  |  load {load_time:.0f}s  |  segment {infer_s/60:.1f} min  '
+          f'|  {total/infer_s:.2f} tiles/s avg')
+
+
 def segment_and_save_JSONs_prob_maps(WSIs, model, out_pth_json, out_pth_prob, inverse=0, step_seg=1)-> None:
     """
     Segments WSIs and saves JSONs + probability maps as float32 TIFFs.

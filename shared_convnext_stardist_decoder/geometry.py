@@ -55,6 +55,179 @@ def polygon_ring_rowcol(coord_rc: np.ndarray) -> np.ndarray:
     return np.vstack([ring, ring[0:1]])
 
 
+def dedupe_nucleus_features_by_centroid(
+    features: list[dict],
+    *,
+    min_dist_px: float,
+) -> list[dict]:
+    """
+    Greedy non-maximum suppression on polygon centroids in slide (pixel) space.
+
+    Use after multi-offset / tiled inference so the same nucleus is not counted many
+    times. Keeps the higher ``prob_peak`` when two centroids fall within
+    ``min_dist_px`` (Euclidean distance on GeoJSON x,y). Typical value is a few
+    pixels below the expected nuclear diameter at the inference level.
+    """
+    if len(features) <= 1:
+        return list(features)
+
+    min_d = float(min_dist_px)
+    if min_d <= 0:
+        return list(features)
+    min_d2 = min_d * min_d
+    cell = max(min_d, 1e-3)
+
+    n = len(features)
+    centroids = np.empty((n, 2), dtype=np.float64)
+    scores = np.empty(n, dtype=np.float64)
+    for i, feat in enumerate(features):
+        ring = np.asarray(feat["geometry"]["coordinates"][0], dtype=np.float64)
+        centroids[i] = ring[:-1].mean(axis=0)
+        scores[i] = float(feat["properties"].get("prob_peak", 0.0))
+
+    order = np.argsort(-scores)
+    buckets: dict[tuple[int, int], list[int]] = {}
+    kept_orig_idx: list[int] = []
+
+    for i in order:
+        i = int(i)
+        cx, cy = centroids[i, 0], centroids[i, 1]
+        ci = int(np.floor(cx / cell))
+        cj = int(np.floor(cy / cell))
+        conflict = False
+        for di in (-2, -1, 0, 1, 2):
+            for dj in (-2, -1, 0, 1, 2):
+                for j in buckets.get((ci + di, cj + dj), ()):
+                    dx = centroids[i, 0] - centroids[j, 0]
+                    dy = centroids[i, 1] - centroids[j, 1]
+                    if dx * dx + dy * dy < min_d2:
+                        conflict = True
+                        break
+                if conflict:
+                    break
+            if conflict:
+                break
+        if conflict:
+            continue
+        kept_orig_idx.append(i)
+        key = (ci, cj)
+        buckets.setdefault(key, []).append(i)
+
+    kept_orig_idx.sort()
+    return [features[i] for i in kept_orig_idx]
+
+
+def dedupe_nucleus_features_by_polygon_overlap(
+    features: list[dict],
+    *,
+    min_overlap_ratio: float = 0.5,
+    grid_cell_px: float = 32.0,
+) -> list[dict]:
+    """
+    Second-stage deduplication: drop polygons that overlap an already-kept polygon
+    "too much" (same nucleus predicted twice with centroids too far apart for
+    :func:`dedupe_nucleus_features_by_centroid`).
+
+    Greedy by descending ``prob_peak``. For each candidate, compares to kept
+    polygons whose bounding boxes may intersect using a spatial grid. Keeps the
+    candidate only if for every kept polygon *j*,
+
+        intersection_area / min(area_i, area_j) < min_overlap_ratio.
+
+    Requires **shapely** (``pip install shapely``).
+    """
+    try:
+        from shapely.geometry import Polygon
+    except ImportError as exc:  # pragma: no cover
+        raise ImportError(
+            "dedupe_nucleus_features_by_polygon_overlap needs shapely>=2. "
+            "Install shapely or disable polygon overlap deduplication."
+        ) from exc
+
+    if len(features) <= 1:
+        return list(features)
+
+    thr = float(min_overlap_ratio)
+    if not (0.0 < thr < 1.0):
+        return list(features)
+    cell = float(grid_cell_px)
+    if cell <= 0:
+        cell = 32.0
+
+    def ring_to_poly(feat: dict) -> Polygon | None:
+        ring = np.asarray(feat["geometry"]["coordinates"][0], dtype=np.float64)
+        if ring.shape[0] >= 2 and np.allclose(ring[0], ring[-1]):
+            ring = ring[:-1]
+        if ring.shape[0] < 3:
+            return None
+        poly = Polygon(ring)
+        if not poly.is_valid:
+            poly = poly.buffer(0)
+        if poly.is_empty or poly.area <= 1e-12:
+            return None
+        return poly
+
+    n = len(features)
+    scores = np.array(
+        [float(f["properties"].get("prob_peak", 0.0)) for f in features],
+        dtype=np.float64,
+    )
+    order = np.argsort(-scores)
+
+    buckets: dict[tuple[int, int], list[int]] = {}
+    kept_poly: dict[int, Polygon] = {}
+    kept_list: list[int] = []
+
+    def cells_touching_bbox(b: tuple[float, float, float, float]) -> list[tuple[int, int]]:
+        minx, miny, maxx, maxy = b
+        ix0 = int(np.floor(minx / cell))
+        iy0 = int(np.floor(miny / cell))
+        ix1 = int(np.floor(maxx / cell))
+        iy1 = int(np.floor(maxy / cell))
+        out: list[tuple[int, int]] = []
+        for ix in range(ix0, ix1 + 1):
+            for iy in range(iy0, iy1 + 1):
+                out.append((ix, iy))
+        return out
+
+    for ii in order:
+        i = int(ii)
+        poly_i = ring_to_poly(features[i])
+        if poly_i is None:
+            continue
+        a_i = poly_i.area
+        bi = poly_i.bounds
+        conflict = False
+        seen_j: set[int] = set()
+        for key in cells_touching_bbox(bi):
+            for j in buckets.get(key, ()):
+                if j in seen_j:
+                    continue
+                seen_j.add(j)
+                poly_j = kept_poly[j]
+                bj = poly_j.bounds
+                if bi[2] < bj[0] or bj[2] < bi[0] or bi[3] < bj[1] or bj[3] < bi[1]:
+                    continue
+                inter = poly_i.intersection(poly_j).area
+                denom = min(a_i, poly_j.area)
+                if denom <= 0:
+                    continue
+                if inter / denom >= thr:
+                    conflict = True
+                    break
+            if conflict:
+                break
+        if conflict:
+            continue
+        kept_list.append(i)
+        kept_poly[i] = poly_i
+        for key in cells_touching_bbox(bi):
+            buckets.setdefault(key, []).append(i)
+
+    kept_list.sort()
+    return [features[i] for i in kept_list]
+
+
 def vote_class(
     cls_logits: np.ndarray, coord_rc: np.ndarray, image_shape: tuple[int, int]
 ) -> tuple[int, np.ndarray]:
