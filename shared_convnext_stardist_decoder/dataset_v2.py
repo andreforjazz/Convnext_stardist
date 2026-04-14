@@ -22,7 +22,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from PIL import Image
-from torch.utils.data import Dataset
+from torch.utils.data import ConcatDataset, Dataset
 import tifffile
 
 from .targets import assemble_targets
@@ -175,15 +175,30 @@ class StardistMultitaskTileDatasetV2(Dataset):
             return None
         if not isinstance(raw, dict):
             return None
+
+        # Legacy annotation files store class labels as INTEGER INDICES using the
+        # old alphabetical class ordering (bladder=0, bone=1, brain=2, …).
+        # When class_to_idx uses a different ordering (e.g. LABELS_VIZ), we must
+        # remap:  old_alpha_int → tissue_name → current config index.
+        # Build the legacy alphabetical index → name lookup once per call.
+        _alpha_idx_to_name: list[str] = sorted(self.class_to_idx.keys())
+
         out: dict[int, int] = {}
         for k, name_or_id in raw.items():
             try:
-                cls_idx = int(name_or_id)
+                raw_int = int(name_or_id)
+                # Remap legacy alphabetical integer to current config index.
+                if 0 <= raw_int < len(_alpha_idx_to_name):
+                    name = _alpha_idx_to_name[raw_int]
+                    cls_idx = self.class_to_idx.get(name, -1)
+                else:
+                    cls_idx = -1
             except (ValueError, TypeError):
+                # Value is already a string class name — look up directly.
                 name = str(name_or_id).strip().lower()
-                if name not in self.class_to_idx:
-                    continue
-                cls_idx = int(self.class_to_idx[name])
+                cls_idx = self.class_to_idx.get(name, -1)
+            if cls_idx < 0:
+                continue
             out[int(k)] = cls_idx
         return out if out else None
 
@@ -246,6 +261,34 @@ class StardistMultitaskTileDatasetV2(Dataset):
         }
 
 
+class ConcatStardistMultitaskDatasetV2(ConcatDataset):
+    """
+    Concatenate several :class:`StardistMultitaskTileDatasetV2` instances so
+    ``train_v2`` can train on GS40 + GS55 (or any multi-root layout) in one run.
+
+    Exposes ``image_paths`` and ``_has_cls_supervision`` for
+    ``WeightedRandomSampler`` compatibility.
+    """
+
+    def __init__(self, datasets: list[StardistMultitaskTileDatasetV2]) -> None:
+        if not datasets:
+            raise ValueError("ConcatStardistMultitaskDatasetV2 requires at least one dataset")
+        super().__init__(datasets)
+        self._image_paths: list[Path] = []
+        for ds in self.datasets:
+            self._image_paths.extend(ds.image_paths)
+
+    @property
+    def image_paths(self) -> list[Path]:
+        return self._image_paths
+
+    def _has_cls_supervision(self, stem: str) -> bool:
+        for ds in self.datasets:
+            if any(p.stem == stem for p in ds.image_paths):
+                return ds._has_cls_supervision(stem)
+        return False
+
+
 def build_class_to_idx_from_dir(labels_dir: Path) -> dict[str, int]:
     labels_dir = Path(labels_dir)
     names: set[str] = set()
@@ -264,6 +307,79 @@ def build_class_to_idx_from_dir(labels_dir: Path) -> dict[str, int]:
     return {n: i for i, n in enumerate(ordered)}
 
 
+def compute_class_weights_from_dirs(
+    labels_dirs: list[Path],
+    class_to_idx: dict[str, int],
+    mode: str = "inv_sqrt_freq",
+    *,
+    train_stem_sets_by_dir: list[list[str]] | None = None,
+) -> torch.Tensor:
+    """
+    Like :func:`compute_class_weights` but aggregates counts across several
+    label directories (e.g. GS40 + GS55 ``train_instance_labels``).
+
+    If *train_stem_sets_by_dir* is set, it must have the same length as
+    *labels_dirs*; only ``{stem}_inst2class.json`` for those stems are read.
+    This avoids globbing huge network folders and matches multi-root training
+    where each root only uses a subset of the global stem list.
+    """
+    n_cls = len(class_to_idx)
+    counts = torch.zeros(n_cls, dtype=torch.float64)
+    _alpha_idx_to_name: list[str] = sorted(class_to_idx.keys())
+
+    def _accumulate_raw(raw: dict) -> None:
+        for _, v in raw.items():
+            try:
+                raw_int = int(v)
+                if 0 <= raw_int < len(_alpha_idx_to_name):
+                    name = _alpha_idx_to_name[raw_int]
+                    cls_idx = class_to_idx.get(name, -1)
+                else:
+                    cls_idx = -1
+            except (ValueError, TypeError):
+                name = str(v).strip().lower()
+                cls_idx = class_to_idx.get(name, -1)
+            if 0 <= cls_idx < n_cls:
+                counts[cls_idx] += 1
+
+    if train_stem_sets_by_dir is not None:
+        if len(train_stem_sets_by_dir) != len(labels_dirs):
+            raise ValueError(
+                "train_stem_sets_by_dir must align 1:1 with labels_dirs "
+                f"({len(train_stem_sets_by_dir)} vs {len(labels_dirs)})"
+            )
+        for labels_dir, stems in zip(labels_dirs, train_stem_sets_by_dir):
+            ld = Path(labels_dir)
+            for stem in stems:
+                p = ld / f"{stem}_inst2class.json"
+                raw = _read_inst2class_raw(p)
+                if isinstance(raw, dict):
+                    _accumulate_raw(raw)
+    else:
+        for labels_dir in labels_dirs:
+            for p in Path(labels_dir).glob("*_inst2class.json"):
+                raw = _read_inst2class_raw(p)
+                if not isinstance(raw, dict):
+                    continue
+                _accumulate_raw(raw)
+
+    if mode == "uniform":
+        return torch.ones(n_cls, dtype=torch.float32)
+
+    counts = counts.clamp(min=1.0)
+    if mode == "inv_freq":
+        w = 1.0 / counts
+    else:
+        w = 1.0 / counts.sqrt()
+
+    w = w / w.mean()
+    print("Class weights (inv_sqrt_freq, normalised):")
+    idx2name = {v: k for k, v in class_to_idx.items()}
+    for i, wi in enumerate(w):
+        print(f"  [{i:2d}] {idx2name.get(i, '?'):20s}  count={int(counts[i]):6d}  weight={wi:.3f}")
+    return w.float()
+
+
 def compute_class_weights(
     labels_dir: Path,
     class_to_idx: dict[str, int],
@@ -278,34 +394,4 @@ def compute_class_weights(
         "inv_sqrt_freq" — weight = 1/√count     (milder, usually safer)
         "uniform"       — weight = 1 for all    (disables reweighting)
     """
-    n_cls = len(class_to_idx)
-    counts = torch.zeros(n_cls, dtype=torch.float64)
-
-    for p in Path(labels_dir).glob("*_inst2class.json"):
-        raw = _read_inst2class_raw(p)
-        if not isinstance(raw, dict):
-            continue
-        for _, v in raw.items():
-            try:
-                cls_idx = int(v)
-            except (ValueError, TypeError):
-                name = str(v).strip().lower()
-                cls_idx = class_to_idx.get(name, -1)
-            if 0 <= cls_idx < n_cls:
-                counts[cls_idx] += 1
-
-    if mode == "uniform":
-        return torch.ones(n_cls, dtype=torch.float32)
-
-    counts = counts.clamp(min=1.0)  # avoid div-by-zero for unseen classes
-    if mode == "inv_freq":
-        w = 1.0 / counts
-    else:  # inv_sqrt_freq (default)
-        w = 1.0 / counts.sqrt()
-
-    w = w / w.mean()  # normalise so mean weight = 1 (keeps loss scale stable)
-    print("Class weights (inv_sqrt_freq, normalised):")
-    idx2name = {v: k for k, v in class_to_idx.items()}
-    for i, wi in enumerate(w):
-        print(f"  [{i:2d}] {idx2name.get(i, '?'):20s}  count={int(counts[i]):6d}  weight={wi:.3f}")
-    return w.float()
+    return compute_class_weights_from_dirs([Path(labels_dir)], class_to_idx, mode)

@@ -22,6 +22,12 @@ Usage:
 
   Warm-start from a V1 checkpoint (seg decoder transfers; cls head re-inits):
     --resume path/to/best.pt --resume_strict false
+
+  Multi-root (e.g. GS40 + GS55 in one run): set ``data.train_sources`` and
+  ``data.val_sources`` to lists of ``{images_dir, labels_dir}``, plus combined
+  ``train_stems`` / ``val_stems``. Each root only keeps stems that exist under
+  its ``images_dir`` (or set per-entry ``stems: [...]`` to override). Omit
+  ``train_images_dir`` when using sources. See ``train_multitask_GS40_GS55_paths.ipynb``.
 """
 from __future__ import annotations
 
@@ -35,9 +41,11 @@ from torch.utils.data import DataLoader, WeightedRandomSampler
 from tqdm import tqdm
 
 from .dataset_v2 import (
+    ConcatStardistMultitaskDatasetV2,
     StardistMultitaskTileDatasetV2,
     build_class_to_idx_from_dir,
     compute_class_weights,
+    compute_class_weights_from_dirs,
 )
 from .losses_v2 import multitask_loss_v2
 from .model_v2 import build_model_v2, load_v1_weights_into_v2
@@ -51,6 +59,67 @@ def load_config(path: Path) -> dict:
 def set_backbone_trainable(model: torch.nn.Module, trainable: bool) -> None:
     for p in model.backbone.parameters():
         p.requires_grad = trainable
+
+
+_IMG_EXTS_TILE = (".png", ".jpg", ".jpeg", ".tif", ".tiff")
+
+
+def _stems_present_under_images_dir(images_dir: Path) -> set[str]:
+    """Stems that have a tile image under *images_dir* (one glob pass per extension)."""
+    out: set[str] = set()
+    root = Path(images_dir)
+    for ext in _IMG_EXTS_TILE:
+        try:
+            for p in root.glob(f"*{ext}"):
+                out.add(p.stem)
+        except OSError as exc:
+            print(f"Warning: could not glob {root} *{ext}: {exc}")
+    return out
+
+
+def stems_for_multi_source(
+    src: dict,
+    stems_global: list[str] | None,
+    *,
+    images_present_cache: dict[str, set[str]],
+) -> list[str] | None:
+    """
+    Resolve stem list for one ``train_sources`` / ``val_sources`` entry.
+
+    Priority order:
+      1. Per-entry ``stems`` list — use exactly as given.
+      2. Per-entry ``stem_prefix`` — keep only stems whose filename starts with
+         this prefix (useful when train/val slides share an images_dir, e.g.
+         GS40 where slide 0451 = train and slide 0326 = val, both in train/images).
+      3. Global ``train_stems`` / ``val_stems`` intersected with files present
+         under this entry's images_dir (the original multi-root behaviour).
+      4. None — load all tiles in the images_dir (no filtering).
+    """
+    if src.get("stems") is not None:
+        return [str(s) for s in src["stems"]]
+
+    key = str(src["images_dir"])
+    if key not in images_present_cache:
+        images_present_cache[key] = _stems_present_under_images_dir(Path(src["images_dir"]))
+    present = images_present_cache[key]
+
+    if src.get("stem_prefix") is not None:
+        prefix = str(src["stem_prefix"])
+        matched = [s for s in present if s.startswith(prefix)]
+        if not matched:
+            raise RuntimeError(
+                f"stem_prefix={prefix!r} matched 0 tiles in {src['images_dir']!r}. "
+                "Check the prefix and images_dir path."
+            )
+        return matched
+
+    if src.get("stem_exclude_prefix") is not None:
+        exclude = str(src["stem_exclude_prefix"])
+        return [s for s in present if not s.startswith(exclude)]
+
+    if stems_global is None:
+        return None
+    return [s for s in stems_global if s in present]
 
 
 class _RunningMean:
@@ -89,15 +158,58 @@ def main() -> None:
     m_cfg    = cfg["model"]
 
     # ── Class index mapping ───────────────────────────────────────────────────
+    # The class order here is the order the MODEL OUTPUTS its logits.
+    # It must match the order in config model.class_names exactly.
+    # Old annotation files store integer class IDs using the ALPHABETICAL order;
+    # dataset_v2._load_inst2class automatically remaps them to this order.
     cn = m_cfg.get("class_names")
     if cn:
         class_to_idx = {str(n).strip().lower(): i for i, n in enumerate(cn)}
+        print("Class order (model output channels):")
+        for i, name in enumerate(cn):
+            print(f"  [{i:2d}]  {name}")
     else:
         class_to_idx = build_class_to_idx_from_dir(Path(data["train_labels_dir"]))
+        print("WARNING: no class_names in config — using auto-detected alphabetical order.")
 
     n_cls = int(m_cfg["num_classes"])
     if cn and len(cn) != n_cls:
         raise ValueError("model.num_classes must equal len(model.class_names)")
+
+    # ── Multi-root: per-source stem lists (intersect global stems with files on disk) ─
+    images_present_cache: dict[str, set[str]] = {}
+    train_stem_sets_per_src: list[list[str]] | None = None
+    val_stem_sets_per_src: list[list[str]] | None = None
+    if data.get("train_sources"):
+        train_stem_sets_per_src = [
+            stems_for_multi_source(s, data.get("train_stems"), images_present_cache=images_present_cache)
+            for s in data["train_sources"]
+        ]
+        val_stem_sets_per_src = [
+            stems_for_multi_source(s, data.get("val_stems"), images_present_cache=images_present_cache)
+            for s in data["val_sources"]
+        ]
+        for i, ts in enumerate(train_stem_sets_per_src):
+            if ts is not None and len(ts) == 0:
+                raise RuntimeError(
+                    f"train_sources[{i}] matched 0 tiles: no train_stems exist under images_dir. "
+                    f"Check paths.\n  images_dir={data['train_sources'][i].get('images_dir')}"
+                )
+        for i, vs in enumerate(val_stem_sets_per_src):
+            if vs is not None and len(vs) == 0:
+                raise RuntimeError(
+                    f"val_sources[{i}] matched 0 tiles: no val_stems exist under images_dir.\n"
+                    f"  images_dir={data['val_sources'][i].get('images_dir')}"
+                )
+        print("Multi-root stem counts (after filtering to each images_dir):")
+        for i, s in enumerate(data["train_sources"]):
+            stems_i = train_stem_sets_per_src[i]
+            ntr = f"{len(stems_i):,}" if stems_i is not None else "all"
+            print(f"  train[{i}] {ntr} tiles  ←  {s.get('images_dir', '')}")
+        for i, s in enumerate(data["val_sources"]):
+            stems_i = val_stem_sets_per_src[i]
+            nv = f"{len(stems_i):,}" if stems_i is not None else "all"
+            print(f"  val[{i}]   {nv} tiles  ←  {s.get('images_dir', '')}")
 
     # ── Output directory ──────────────────────────────────────────────────────
     out_dir = Path(ckpt_cfg["out_dir"]) / cfg.get("experiment_name", "experiment_v2")
@@ -118,9 +230,28 @@ def main() -> None:
     class_weights: torch.Tensor | None = None
     if cw_cfg == "auto" and class_to_idx:
         print("Computing class weights from training labels …")
-        class_weights = compute_class_weights(
-            Path(data["train_labels_dir"]), class_to_idx, mode="inv_sqrt_freq"
-        ).to(device)
+        if data.get("train_sources"):
+            lw_dirs = [Path(s["labels_dir"]) for s in data["train_sources"]]
+            if train_stem_sets_per_src is not None and all(
+                x is not None for x in train_stem_sets_per_src
+            ):
+                class_weights = compute_class_weights_from_dirs(
+                    lw_dirs,
+                    class_to_idx,
+                    mode="inv_sqrt_freq",
+                    train_stem_sets_by_dir=train_stem_sets_per_src,
+                ).to(device)
+            else:
+                print(
+                    "  (class weights: scanning all *_inst2class.json per labels_dir — slow on large dirs)"
+                )
+                class_weights = compute_class_weights_from_dirs(
+                    lw_dirs, class_to_idx, mode="inv_sqrt_freq"
+                ).to(device)
+        else:
+            class_weights = compute_class_weights(
+                Path(data["train_labels_dir"]), class_to_idx, mode="inv_sqrt_freq"
+            ).to(device)
     elif isinstance(cw_cfg, list) and len(cw_cfg) == n_cls:
         class_weights = torch.tensor(cw_cfg, dtype=torch.float32, device=device)
         print(f"Using manually specified class weights: {class_weights.tolist()}")
@@ -128,7 +259,15 @@ def main() -> None:
         print("Class weights: uniform (disabled)")
 
     # ── Model ─────────────────────────────────────────────────────────────────
-    model = build_model_v2(cfg).to(device)
+    # When resuming from a checkpoint the pretrained HF backbone weights would be
+    # loaded and then immediately overwritten — skip that wasted download.
+    if args.resume and args.resume.is_file():
+        import copy
+        cfg_build = copy.deepcopy(cfg)
+        cfg_build.setdefault("model", {})["pretrained"] = False
+        model = build_model_v2(cfg_build).to(device)
+    else:
+        model = build_model_v2(cfg).to(device)
     if args.resume and args.resume.is_file():
         sd = torch.load(args.resume, map_location=device, weights_only=True)
         if args.resume_strict:
@@ -143,25 +282,72 @@ def main() -> None:
     cache_to_ram = bool(data.get("cache_to_ram", False))
     cls_only     = bool(tr_cfg.get("cls_only", False))
 
-    train_ds = StardistMultitaskTileDatasetV2(
-        Path(data["train_images_dir"]),
-        Path(data["train_labels_dir"]),
-        n_rays=int(m_cfg["n_rays"]),
-        patch_size=ps,
-        class_to_idx=class_to_idx if class_to_idx else None,
-        stems=data.get("train_stems"),
-        cache_to_ram=cache_to_ram,
-        cls_only=cls_only,
+    _has_tr_src = bool(data.get("train_sources"))
+    _has_va_src = bool(data.get("val_sources"))
+    if _has_tr_src ^ _has_va_src:
+        raise ValueError(
+            "Multi-root training: set both data.train_sources and data.val_sources "
+            "(list of {images_dir, labels_dir}), or omit both and use train_images_dir / val_*."
+        )
+
+    def _build_tile_dataset(
+        *,
+        sources_key: str,
+        stems_key: str,
+        cls_only_flag: bool,
+        stem_sets_per_src: list[list[str]] | None,
+    ):
+        """Single-root (legacy) or multi-root via ``train_sources`` / ``val_sources``."""
+        sources = data.get(sources_key)
+        stems = data.get(stems_key)
+        if sources:
+            if stem_sets_per_src is None or len(stem_sets_per_src) != len(sources):
+                raise ValueError(
+                    "internal error: stem_sets_per_src must align with train_sources/val_sources"
+                )
+            parts: list[StardistMultitaskTileDatasetV2] = []
+            for src, stems_this in zip(sources, stem_sets_per_src):
+                parts.append(
+                    StardistMultitaskTileDatasetV2(
+                        Path(src["images_dir"]),
+                        Path(src["labels_dir"]),
+                        n_rays=int(m_cfg["n_rays"]),
+                        patch_size=ps,
+                        class_to_idx=class_to_idx if class_to_idx else None,
+                        stems=stems_this,
+                        cache_to_ram=cache_to_ram,
+                        cls_only=cls_only_flag,
+                    )
+                )
+            return (
+                ConcatStardistMultitaskDatasetV2(parts)
+                if len(parts) > 1
+                else parts[0]
+            )
+        img_k = "train_images_dir" if stems_key == "train_stems" else "val_images_dir"
+        lab_k = "train_labels_dir" if stems_key == "train_stems" else "val_labels_dir"
+        return StardistMultitaskTileDatasetV2(
+            Path(data[img_k]),
+            Path(data[lab_k]),
+            n_rays=int(m_cfg["n_rays"]),
+            patch_size=ps,
+            class_to_idx=class_to_idx if class_to_idx else None,
+            stems=stems,
+            cache_to_ram=cache_to_ram,
+            cls_only=cls_only_flag,
+        )
+
+    train_ds = _build_tile_dataset(
+        sources_key="train_sources",
+        stems_key="train_stems",
+        cls_only_flag=cls_only,
+        stem_sets_per_src=train_stem_sets_per_src,
     )
-    val_ds = StardistMultitaskTileDatasetV2(
-        Path(data["val_images_dir"]),
-        Path(data["val_labels_dir"]),
-        n_rays=int(m_cfg["n_rays"]),
-        patch_size=ps,
-        class_to_idx=class_to_idx if class_to_idx else None,
-        stems=data.get("val_stems"),
-        cache_to_ram=cache_to_ram,
-        cls_only=False,   # always evaluate on full val set
+    val_ds = _build_tile_dataset(
+        sources_key="val_sources",
+        stems_key="val_stems",
+        cls_only_flag=False,
+        stem_sets_per_src=val_stem_sets_per_src,
     )
 
     # Optional: WeightedRandomSampler to over-sample tiles with cls supervision

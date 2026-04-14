@@ -1,0 +1,90 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# Fine-tuning config for GS40 ConvNextV2-StarDist
+# Start from: epoch-6 checkpoint (best val_loss=2.374)
+#
+# ANALYSIS of training log (epochs 1-10):
+#   • Epochs 1-6: backbone frozen, steady val improvement  (3.21 → 2.37)
+#   • Epoch 6:    best checkpoint                          val_loss=2.374 ★
+#   • Epochs 7-10: backbone unfrozen, LR still 1e-4
+#     → train loss plummeted (overfitting), val INCREASED back to 2.47
+#     → stop current training and resume from epoch 6
+#
+# CLASS IMBALANCE (from training log):
+#   mesokidney: 965,885 instances  →  28× more than pancreas (34,087)
+#   spleen2:     19,615 instances  →  worst represented class
+#   Current inv_sqrt_freq partially corrects this but not enough for spleen2.
+#
+# FINE-TUNING STRATEGY:
+#   1. Frozen backbone first 2 epochs (warm head only)
+#   2. Very low backbone LR (1e-5) vs head LR (5e-4) via differential LR
+#      — achieved by setting lr=5e-4 and freeze_backbone_epochs=2
+#      — then backbone trains at lr * backbone_lr_scale = 5e-4 * 0.02 = 1e-5
+#   3. Stronger class weight boost for rare classes
+#   4. More aggressive data augmentation
+#   5. CosineAnnealingLR with T_max=20 for smooth decay
+# ──────────────────────────────────────────────────────────────────────────────
+
+experiment_name: convnext_stardist_gs40_finetune_from_e11
+
+data:
+  train_images_dir: \\kittyserverdw\Andre_kit\data\students\Diogo\data\fetal\GS40\cellvit_training\dataset_256_40k_48_slides\train\images
+  train_labels_dir: \\kittyserverdw\Andre_kit\data\students\Diogo\data\fetal\GS40\cellvit_training\dataset_256_40k_48_slides\stardist_multitask_ready\train_instance_labels
+  val_images_dir:   \\kittyserverdw\Andre_kit\data\students\Diogo\data\fetal\GS40\cellvit_training\dataset_256_40k_48_slides\train\images
+  # Use same mask dir as multitask config; val_instance_labels had no matching PNGs → zero dist/cls on val.
+  val_labels_dir:   \\kittyserverdw\Andre_kit\data\students\Diogo\data\fetal\GS40\cellvit_training\dataset_256_40k_48_slides\stardist_multitask_ready\train_instance_labels
+  cache_to_ram: false   # ✅ ENABLED — 512GB RAM is plenty
+
+model:
+  backbone: facebook/convnextv2-tiny-22k-224
+  n_rays: 32
+  num_classes: 19
+  decoder_channels: 128
+  cls_semantic_dim: 64
+  class_names:
+    - bone
+    - brain
+    - eye
+    - heart
+    - lungs
+    - gi
+    - liver
+    - spleen
+    - pancreas
+    - kidney
+    - mesokidney
+    - collagen
+    - ear
+    - nontissue
+    - thymus
+    - thyroid
+    - bladder
+    - skull
+    - spleen2
+
+train:
+  patch_size: 256
+  batch_size: 8
+  num_workers: 8           # ← Increase since data is in RAM
+  epochs: 15
+  lr: 0.00001
+  lr_min: 1.0e-07
+  weight_decay: 0.05
+  amp: true
+  freeze_backbone_epochs: 5
+  loss_w_prob: 2.0
+  loss_w_dist: 0.15
+  loss_w_cls: 0.5
+  loss_w_inst: 0.1
+  class_weights: auto
+  cls_balanced_sampler: true
+  cls_only: false
+
+checkpoint:
+  out_dir: \\kittyserverdw\Andre_kit\data\students\Diogo\data\fetal\GS40\cellvit_training\dataset_256_40k_48_slides\convnext_stardist_multitask_runs\run_fold0_FINETUNE_e11
+  save_every: 1
+
+infer:
+  prob_thresh: 0.40
+  nms_dist: 4
+  sample_offsets:
+    - 0

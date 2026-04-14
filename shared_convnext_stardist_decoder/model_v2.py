@@ -59,13 +59,21 @@ class StardistMultitaskNetV2(nn.Module):
         n_rays: int = 32,
         num_classes: int = 19,
         decoder_channels: int = 128,
-        cls_semantic_dim: int = 64,   # channels from stage-4 semantic skip
+        cls_semantic_dim: int = 128,  # channels from stage-4 semantic skip
+        head_cls_layers: int = 2,     # 1 = single Conv2d (old), 2 = two-layer MLP (new)
     ) -> None:
         super().__init__()
         self.n_rays = int(n_rays)
         self.num_classes = int(num_classes)
+        self.head_cls_layers = int(head_cls_layers)
 
-        self.backbone = AutoModel.from_pretrained(backbone_name, use_safetensors=True)
+        if pretrained:
+            self.backbone = AutoModel.from_pretrained(backbone_name, use_safetensors=True)
+        else:
+            from transformers import AutoConfig
+            self.backbone = AutoModel.from_config(
+                AutoConfig.from_pretrained(backbone_name)
+            )
 
         ch = [96, 192, 384, 768]   # ConvNeXt V2 Tiny stage channels
         dc = int(decoder_channels)
@@ -97,7 +105,17 @@ class StardistMultitaskNetV2(nn.Module):
         )
 
         # ── Classification head: decoder_out (dc) + semantic skip (S) → C ────
-        self.head_cls = nn.Conv2d(dc + S, self.num_classes, 1)
+        if self.head_cls_layers == 1:
+            # Legacy single-layer head — used for loading old checkpoints
+            self.head_cls = nn.Conv2d(dc + S, self.num_classes, 1)
+        else:
+            # Two-layer MLP head — default for new training runs
+            self.head_cls = nn.Sequential(
+                nn.Conv2d(dc + S, 128, 1, bias=False),
+                nn.BatchNorm2d(128),
+                nn.GELU(),
+                nn.Conv2d(128, self.num_classes, 1),
+            )
 
     def forward(
         self, x: torch.Tensor
@@ -136,7 +154,8 @@ def build_model_v2(cfg: dict) -> StardistMultitaskNetV2:
         n_rays           = int(m.get("n_rays", 32)),
         num_classes      = int(m.get("num_classes", 19)),
         decoder_channels = int(m.get("decoder_channels", 128)),
-        cls_semantic_dim = int(m.get("cls_semantic_dim", 64)),
+        cls_semantic_dim = int(m.get("cls_semantic_dim", 128)),
+        head_cls_layers  = int(m.get("head_cls_layers", 2)),
     )
 
 

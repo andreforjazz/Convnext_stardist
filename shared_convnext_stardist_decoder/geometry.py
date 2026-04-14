@@ -44,6 +44,94 @@ def dist_at_points(dist_map: np.ndarray, points: np.ndarray) -> np.ndarray:
     return np.asarray(out, dtype=np.float32)
 
 
+def dist_at_points_bilinear(dist_map: np.ndarray, points: np.ndarray) -> np.ndarray:
+    """Sample (H,W,R) dist_map with bilinear interpolation at (row, col); points may be sub-pixel."""
+    from scipy.ndimage import map_coordinates
+
+    dist_map = np.asarray(dist_map, dtype=np.float32)
+    points = np.asarray(points, dtype=np.float64)
+    if dist_map.ndim != 3:
+        raise ValueError("dist_map must be (H, W, R)")
+    H, W, R = dist_map.shape
+    n = len(points)
+    if n == 0:
+        return np.zeros((0, R), dtype=np.float32)
+    out = np.empty((n, R), dtype=np.float32)
+    coords = np.stack([points[:, 0], points[:, 1]], axis=0)
+    for k in range(R):
+        out[:, k] = map_coordinates(
+            dist_map[:, :, k],
+            coords,
+            order=1,
+            mode="nearest",
+            prefilter=False,
+        ).astype(np.float32)
+    return out
+
+
+def refine_peaks_local_com(
+    peaks_rc: np.ndarray,
+    prob_hw: np.ndarray,
+    radius_px: int,
+) -> np.ndarray:
+    """
+    Nudge each peak toward the intensity-weighted centroid of ``prob`` in a square window.
+    Improves star-polygon fit when the discrete peak sits off the true nuclear center
+    (common on elongated or noisy blobs). Returns float (row, col) per peak.
+    """
+    peaks_rc = np.asarray(peaks_rc, dtype=np.float64)
+    prob_hw = np.asarray(prob_hw, dtype=np.float32)
+    if len(peaks_rc) == 0:
+        return peaks_rc
+    H, W = prob_hw.shape
+    rad = int(max(0, radius_px))
+    out = np.empty_like(peaks_rc, dtype=np.float64)
+    for i, (r, c) in enumerate(peaks_rc):
+        r0 = int(max(0, np.floor(r - rad)))
+        r1 = int(min(H, np.ceil(r + rad + 1)))
+        c0 = int(max(0, np.floor(c - rad)))
+        c1 = int(min(W, np.ceil(c + rad + 1)))
+        patch = prob_hw[r0:r1, c0:c1]
+        s = float(patch.sum())
+        if s < 1e-12:
+            out[i, 0], out[i, 1] = float(r), float(c)
+            continue
+        yy, xx = np.mgrid[r0:r1, c0:c1]
+        out[i, 0] = float((yy * patch).sum() / s)
+        out[i, 1] = float((xx * patch).sum() / s)
+    return out
+
+
+def dists_and_coords_from_peaks(
+    dist_map_nrays_hw: np.ndarray,
+    peaks_rc: np.ndarray,
+    prob_hw: np.ndarray,
+    *,
+    refine_local_com: bool = False,
+    refine_radius_px: int = 8,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Build ray distances and vertex coords for all peaks in one tile.
+
+    ``dist_map_nrays_hw``: (n_rays, H, W) as returned by the model.
+    If ``refine_local_com``, shifts each peak to local prob COM then samples rays with bilinear
+    interpolation (recommended together).
+    """
+    dist_hw_r = np.transpose(np.asarray(dist_map_nrays_hw, dtype=np.float32), (1, 2, 0))
+    peaks_rc = np.asarray(peaks_rc)
+    if len(peaks_rc) == 0:
+        n_rays = dist_hw_r.shape[2]
+        return np.zeros((0, n_rays), dtype=np.float32), np.zeros((0, 2, n_rays), dtype=np.float32)
+    if refine_local_com:
+        pts = refine_peaks_local_com(peaks_rc, prob_hw, refine_radius_px)
+        dists = dist_at_points_bilinear(dist_hw_r, pts)
+        coords = dist_to_coord(dists, pts.astype(np.float32))
+    else:
+        dists = dist_at_points(dist_hw_r, peaks_rc)
+        coords = dist_to_coord(dists, peaks_rc.astype(np.float32))
+    return dists, coords
+
+
 def polygon_ring_rowcol(coord_rc: np.ndarray) -> np.ndarray:
     """
     coord_rc: (2, n_rays) row, col vertices
@@ -61,12 +149,12 @@ def dedupe_nucleus_features_by_centroid(
     min_dist_px: float,
 ) -> list[dict]:
     """
-    Greedy non-maximum suppression on polygon centroids in slide (pixel) space.
+    Greedy NMS on polygon centroids (slide pixel space), O(n log n) via cKDTree.
 
-    Use after multi-offset / tiled inference so the same nucleus is not counted many
-    times. Keeps the higher ``prob_peak`` when two centroids fall within
-    ``min_dist_px`` (Euclidean distance on GeoJSON x,y). Typical value is a few
-    pixels below the expected nuclear diameter at the inference level.
+    For each nucleus processed in descending ``prob_peak`` order: keep it if no
+    already-kept nucleus lies within ``min_dist_px`` (Euclidean on GeoJSON x,y);
+    otherwise discard. Falls back to a spatial-hash implementation when scipy is
+    not available so the function always works.
     """
     if len(features) <= 1:
         return list(features)
@@ -74,8 +162,6 @@ def dedupe_nucleus_features_by_centroid(
     min_d = float(min_dist_px)
     if min_d <= 0:
         return list(features)
-    min_d2 = min_d * min_d
-    cell = max(min_d, 1e-3)
 
     n = len(features)
     centroids = np.empty((n, 2), dtype=np.float64)
@@ -85,35 +171,57 @@ def dedupe_nucleus_features_by_centroid(
         centroids[i] = ring[:-1].mean(axis=0)
         scores[i] = float(feat["properties"].get("prob_peak", 0.0))
 
-    order = np.argsort(-scores)
-    buckets: dict[tuple[int, int], list[int]] = {}
-    kept_orig_idx: list[int] = []
+    try:
+        from scipy.spatial import cKDTree  # O(n log n) — fast for millions of nuclei
 
-    for i in order:
-        i = int(i)
-        cx, cy = centroids[i, 0], centroids[i, 1]
-        ci = int(np.floor(cx / cell))
-        cj = int(np.floor(cy / cell))
-        conflict = False
-        for di in (-2, -1, 0, 1, 2):
-            for dj in (-2, -1, 0, 1, 2):
-                for j in buckets.get((ci + di, cj + dj), ()):
-                    dx = centroids[i, 0] - centroids[j, 0]
-                    dy = centroids[i, 1] - centroids[j, 1]
-                    if dx * dx + dy * dy < min_d2:
-                        conflict = True
+        order = np.argsort(-scores)
+        # Pre-compute all within-radius neighbor lists in one C call.
+        tree = cKDTree(centroids)
+        neighbors_all = tree.query_ball_point(centroids, r=min_d, workers=-1)
+
+        state = np.zeros(n, dtype=np.int8)  # 0=unseen  1=kept  -1=removed
+        for idx in order:
+            idx = int(idx)
+            if state[idx] == -1:
+                continue
+            state[idx] = 1  # keep
+            for nb in neighbors_all[idx]:
+                if state[nb] == 0:
+                    state[nb] = -1  # mark neighbors as removed
+
+        kept_orig_idx = sorted(int(i) for i in np.where(state == 1)[0])
+
+    except ImportError:
+        # Fallback: spatial-hash grid (pure numpy, O(n) amortized)
+        min_d2 = min_d * min_d
+        cell = max(min_d, 1e-3)
+        order = np.argsort(-scores)
+        buckets: dict[tuple[int, int], list[int]] = {}
+        kept_orig_idx = []
+        for i in order:
+            i = int(i)
+            cx, cy = centroids[i, 0], centroids[i, 1]
+            ci = int(np.floor(cx / cell))
+            cj = int(np.floor(cy / cell))
+            conflict = False
+            for di in (-2, -1, 0, 1, 2):
+                for dj in (-2, -1, 0, 1, 2):
+                    for j in buckets.get((ci + di, cj + dj), ()):
+                        dx = centroids[i, 0] - centroids[j, 0]
+                        dy = centroids[i, 1] - centroids[j, 1]
+                        if dx * dx + dy * dy < min_d2:
+                            conflict = True
+                            break
+                    if conflict:
                         break
                 if conflict:
                     break
             if conflict:
-                break
-        if conflict:
-            continue
-        kept_orig_idx.append(i)
-        key = (ci, cj)
-        buckets.setdefault(key, []).append(i)
+                continue
+            kept_orig_idx.append(i)
+            buckets.setdefault((ci, cj), []).append(i)
+        kept_orig_idx.sort()
 
-    kept_orig_idx.sort()
     return [features[i] for i in kept_orig_idx]
 
 
@@ -121,6 +229,7 @@ def dedupe_nucleus_features_by_polygon_overlap(
     features: list[dict],
     *,
     min_overlap_ratio: float = 0.5,
+    min_iou: float | None = None,
     grid_cell_px: float = 32.0,
 ) -> list[dict]:
     """
@@ -132,7 +241,14 @@ def dedupe_nucleus_features_by_polygon_overlap(
     polygons whose bounding boxes may intersect using a spatial grid. Keeps the
     candidate only if for every kept polygon *j*,
 
-        intersection_area / min(area_i, area_j) < min_overlap_ratio.
+        intersection_area / min(area_i, area_j) < min_overlap_ratio
+
+    and, if ``min_iou`` is not None,
+
+        intersection_area / union_area < min_iou.
+
+    IoU catches elongated / dumbbell nuclei where two peaks sit far apart but the
+    polygons still overlap substantially (centroid NMS alone misses those).
 
     Requires **shapely** (``pip install shapely``).
     """
@@ -150,6 +266,13 @@ def dedupe_nucleus_features_by_polygon_overlap(
     thr = float(min_overlap_ratio)
     if not (0.0 < thr < 1.0):
         return list(features)
+    iou_thr: float | None
+    if min_iou is None:
+        iou_thr = None
+    else:
+        iou_thr = float(min_iou)
+        if not (0.0 < iou_thr < 1.0):
+            iou_thr = None
     cell = float(grid_cell_px)
     if cell <= 0:
         cell = 32.0
@@ -215,6 +338,11 @@ def dedupe_nucleus_features_by_polygon_overlap(
                 if inter / denom >= thr:
                     conflict = True
                     break
+                if iou_thr is not None:
+                    union = a_i + poly_j.area - inter
+                    if union > 0 and inter / union >= iou_thr:
+                        conflict = True
+                        break
             if conflict:
                 break
         if conflict:
