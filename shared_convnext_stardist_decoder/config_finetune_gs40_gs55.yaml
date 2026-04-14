@@ -9,7 +9,7 @@
 #
 # FINE-TUNING STRATEGY:
 #   1. Resume from best.pt (epoch 14) via --resume flag
-#   2. stem_exclude_prefix for GS40 train (all slides except val slide 0326); stem_prefix for val
+#   2. stem_prefix=0451 for GS40 train (same slide as original training); stem_prefix=0326 for val
 #   3. Backbone unfrozen from the start (already well-trained)
 #   4. Very low LR (1e-5) for the whole model; backbone can continue adapting
 #   5. CosineAnnealingLR T_max = epochs for smooth decay to lr_min
@@ -19,16 +19,17 @@
 experiment_name: convnext_stardist_mt_gs40_gs55_v2_finetune
 
 data:
+  # Borrow the exact train/val stem lists from the main training config.
+  # stems are intersected with files actually on disk, so missing dups are skipped silently.
+  train_stems_from: config_gs40_gs55_multitask.yaml
   train_sources:
   - images_dir: \\kittyserverdw\Andre_kit\data\students\Diogo\data\fetal\GS40\cellvit_training\dataset_256_40k_48_slides\train\images
     labels_dir: \\kittyserverdw\Andre_kit\data\students\Diogo\data\fetal\GS40\cellvit_training\dataset_256_40k_48_slides\stardist_multitask_ready\train_instance_labels
-    stem_exclude_prefix: monkey_fetus_40_0326  # exclude val slide; keep all other slides
   - images_dir: \\kittyserverdw\Andre_kit\data\students\Diogo\data\fetal\GS55\cellvit_training\dataset_256_40k_GS55\train\images
     labels_dir: \\kittyserverdw\Andre_kit\data\students\Diogo\data\fetal\GS55\cellvit_training\dataset_256_40k_GS55\train\labels
   val_sources:
   - images_dir: \\kittyserverdw\Andre_kit\data\students\Diogo\data\fetal\GS40\cellvit_training\dataset_256_40k_48_slides\train\images
     labels_dir: \\kittyserverdw\Andre_kit\data\students\Diogo\data\fetal\GS40\cellvit_training\dataset_256_40k_48_slides\stardist_multitask_ready\train_instance_labels
-    stem_prefix: monkey_fetus_40_0326  # held-out val slide; lives in same dir as train
   - images_dir: \\kittyserverdw\Andre_kit\data\students\Diogo\data\fetal\GS55\cellvit_training\dataset_256_40k_GS55\val\images
     labels_dir: \\kittyserverdw\Andre_kit\data\students\Diogo\data\fetal\GS55\cellvit_training\dataset_256_40k_GS55\val\labels
   cache_to_ram: false
@@ -71,7 +72,7 @@ train:
   lr_min: 1.0e-07
   weight_decay: 0.03
   amp: true
-  freeze_backbone_epochs: 5
+  freeze_backbone_epochs: 0
   loss_w_prob: 2.0
   loss_w_dist: 0.15
   loss_w_cls: 1.0

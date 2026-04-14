@@ -157,6 +157,22 @@ def main() -> None:
     ckpt_cfg = cfg["checkpoint"]
     m_cfg    = cfg["model"]
 
+    # ── Borrow train_stems / val_stems from another config if requested ──────
+    # Allows finetune configs to reuse the curated stem lists from the main
+    # training config without duplicating thousands of lines.
+    # Usage in config:  data.train_stems_from: path/to/config_gs40_gs55_multitask.yaml
+    if data.get("train_stems_from"):
+        src_path = Path(data["train_stems_from"])
+        if not src_path.is_absolute():
+            src_path = Path(args.config).parent / src_path
+        src_data = load_config(src_path).get("data", {})
+        if "train_stems" not in data and src_data.get("train_stems"):
+            data["train_stems"] = src_data["train_stems"]
+            print(f"train_stems loaded from {src_path.name}  ({len(data['train_stems']):,} stems)")
+        if "val_stems" not in data and src_data.get("val_stems"):
+            data["val_stems"] = src_data["val_stems"]
+            print(f"val_stems   loaded from {src_path.name}  ({len(data['val_stems']):,} stems)")
+
     # ── Class index mapping ───────────────────────────────────────────────────
     # The class order here is the order the MODEL OUTPUTS its logits.
     # It must match the order in config model.class_names exactly.
