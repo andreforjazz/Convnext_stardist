@@ -312,6 +312,7 @@ def main() -> None:
         stems_key: str,
         cls_only_flag: bool,
         stem_sets_per_src: list[list[str]] | None,
+        augment: bool = False,
     ):
         """Single-root (legacy) or multi-root via ``train_sources`` / ``val_sources``."""
         sources = data.get(sources_key)
@@ -333,6 +334,7 @@ def main() -> None:
                         stems=stems_this,
                         cache_to_ram=cache_to_ram,
                         cls_only=cls_only_flag,
+                        augment=augment,
                     )
                 )
             return (
@@ -351,19 +353,23 @@ def main() -> None:
             stems=stems,
             cache_to_ram=cache_to_ram,
             cls_only=cls_only_flag,
+            augment=augment,
         )
 
+    online_augment = bool(data.get("online_augment", True))
     train_ds = _build_tile_dataset(
         sources_key="train_sources",
         stems_key="train_stems",
         cls_only_flag=cls_only,
         stem_sets_per_src=train_stem_sets_per_src,
+        augment=online_augment,
     )
     val_ds = _build_tile_dataset(
         sources_key="val_sources",
         stems_key="val_stems",
         cls_only_flag=False,
         stem_sets_per_src=val_stem_sets_per_src,
+        augment=False,
     )
 
     # Optional: WeightedRandomSampler to over-sample tiles with cls supervision
@@ -405,9 +411,18 @@ def main() -> None:
     print(f"Train: {len(train_ds):,} tiles  |  Val: {len(val_ds):,} tiles")
 
     # ── Optimiser & scheduler ─────────────────────────────────────────────────
-    opt    = torch.optim.AdamW(
-        model.parameters(),
-        lr=float(tr_cfg["lr"]),
+    # backbone_lr_scale: backbone gets a fraction of the head LR (default 0.1).
+    # This prevents the pretrained backbone from overfitting when unfrozen.
+    base_lr          = float(tr_cfg["lr"])
+    backbone_lr_scale = float(tr_cfg.get("backbone_lr_scale", 0.1))
+    backbone_params  = list(model.backbone.parameters())
+    backbone_ids     = {id(p) for p in backbone_params}
+    head_params      = [p for p in model.parameters() if id(p) not in backbone_ids]
+    opt = torch.optim.AdamW(
+        [
+            {"params": backbone_params, "lr": base_lr * backbone_lr_scale},
+            {"params": head_params,     "lr": base_lr},
+        ],
         weight_decay=float(tr_cfg["weight_decay"]),
     )
     scaler = torch.amp.GradScaler(

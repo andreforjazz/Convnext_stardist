@@ -1,0 +1,73 @@
+experiment_name: convnext_stardist_mt_gs40_gs55_v4
+
+data:
+  # Borrow the exact train/val stem lists from v3 (same dataset, no need to duplicate).
+  train_stems_from: config_gs40_gs55_multitask.yaml
+  train_sources:
+  - images_dir: \\kittyserverdw\Andre_kit\data\students\Diogo\data\fetal\GS40\cellvit_training\dataset_256_40k_48_slides\train\images
+    labels_dir: \\kittyserverdw\Andre_kit\data\students\Diogo\data\fetal\GS40\cellvit_training\dataset_256_40k_48_slides\stardist_multitask_ready\train_instance_labels
+  - images_dir: \\kittyserverdw\Andre_kit\data\students\Diogo\data\fetal\GS55\cellvit_training\dataset_256_50k_clsbal_GS55\train\images
+    labels_dir: \\kittyserverdw\Andre_kit\data\students\Diogo\data\fetal\GS55\cellvit_training\dataset_256_50k_clsbal_GS55\train\labels
+  val_sources:
+  - images_dir: \\kittyserverdw\Andre_kit\data\students\Diogo\data\fetal\GS40\cellvit_training\dataset_256_40k_48_slides\train\images
+    labels_dir: \\kittyserverdw\Andre_kit\data\students\Diogo\data\fetal\GS40\cellvit_training\dataset_256_40k_48_slides\stardist_multitask_ready\train_instance_labels
+  - images_dir: \\kittyserverdw\Andre_kit\data\students\Diogo\data\fetal\GS55\cellvit_training\dataset_256_50k_clsbal_GS55\val\images
+    labels_dir: \\kittyserverdw\Andre_kit\data\students\Diogo\data\fetal\GS55\cellvit_training\dataset_256_50k_clsbal_GS55\val\labels
+  cache_to_ram: false
+  online_augment: true   # random color jitter + blur at train time
+
+model:
+  backbone: facebook/convnextv2-tiny-22k-224
+  pretrained: true
+  n_rays: 32
+  class_names:
+  - bone
+  - brain
+  - eye
+  - heart
+  - lungs
+  - gi
+  - liver
+  - spleen
+  - pancreas
+  - kidney
+  - mesokidney
+  - collagen
+  - ear
+  - nontissue
+  - thymus
+  - thyroid
+  - bladder
+  - skull
+  - spleen2
+  num_classes: 19
+  decoder_channels: 128
+  cls_semantic_dim: 128
+  head_cls_layers: 2
+
+train:
+  patch_size: 256
+  batch_size: 8
+  num_workers: 8
+  epochs: 40
+  lr: 3.0e-05              # reduced from 5e-5 — gentler full-model LR
+  lr_min: 1.0e-06
+  weight_decay: 0.05       # increased from 0.03 — stronger regularisation
+  amp: true
+  freeze_backbone_epochs: 5    # reduced from 10 — backbone unfreezes earlier at lower LR
+  backbone_lr_scale: 0.1   # backbone gets 0.1× head LR when unfrozen (= 3e-6)
+  loss_w_prob: 2.0
+  loss_w_dist: 0.15
+  loss_w_cls: 1.0
+  loss_w_inst: 0.25
+  class_weights: auto
+  cls_balanced_sampler: true
+  cls_only: false
+
+checkpoint:
+  out_dir: \\kittyserverdw\Andre_kit\data\students\Diogo\data\fetal\GS40\cellvit_training\dataset_256_40k_48_slides\convnext_stardist_multitask_runs\run_gs40_gs55_v4
+  save_every: 1
+
+infer:
+  prob_thresh: 0.45
+  nms_dist: 3

@@ -46,3 +46,12 @@ Thumbs.db
 data/
 outputs/
 wandb/
+
+# Claude Code internal files
+.claude/
+CLAUDE.html
+CLAUDE_files/
+edit_nb.py
+edit_v4_nb.py
+edit_nb.log
+new

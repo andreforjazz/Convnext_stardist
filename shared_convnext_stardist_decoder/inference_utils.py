@@ -709,6 +709,108 @@ def process_tile_batch(
     return features, gpu_time
 
 
+def postprocess_batch_v4(
+    meta: list[tuple[int, int, int, int]],
+    results: list[tuple[np.ndarray, np.ndarray, np.ndarray]],
+    *,
+    nms_dist: int = 8,
+    prob_thresh: float = 0.45,
+    refine_local_com: bool = True,
+    refine_radius_px: int = 8,
+    valid_margin: int = 0,
+    w_slide: int,
+    h_slide: int,
+    idx2label: dict[int, str],
+    cls_perm: np.ndarray | None = None,
+    vote_window_px: int = 9,
+    include_class_probs: bool = True,
+) -> list[dict]:
+    """CPU-only post-processing for a batch of forward-pass results.
+
+    Separating this from the GPU forward pass allows the caller to pipeline:
+    run this in a background thread while the next GPU batch is already in flight.
+
+    ``local_peaks`` and ``dists_and_coords_from_peaks`` are dispatched in parallel
+    across tiles via a thread pool (both functions release the GIL in C/Cython).
+    """
+    from geometry import local_peaks, dists_and_coords_from_peaks  # type: ignore
+    from scipy.ndimage import uniform_filter as _uf
+    from scipy.special import softmax as _softmax
+    import concurrent.futures as _cf
+
+    vm = int(valid_margin) if valid_margin else 0
+    features: list[dict] = []
+
+    def _tile_peaks(args: tuple) -> tuple:
+        prob, dist_m = args
+        pks = local_peaks(prob, min_distance=int(nms_dist), thresh=float(prob_thresh))
+        if not len(pks):
+            return None, None
+        _, coords = dists_and_coords_from_peaks(
+            dist_m, pks, prob,
+            refine_local_com=refine_local_com,
+            refine_radius_px=int(refine_radius_px),
+        )
+        return pks, coords
+
+    # Parallel local_peaks across tiles — each call is independent and releases GIL
+    n_workers = min(len(results), 8)
+    with _cf.ThreadPoolExecutor(max_workers=n_workers) as _pool:
+        peaks_coords = list(_pool.map(_tile_peaks, [(p, d) for p, d, _ in results]))
+
+    for (x0, y0, tw, th), (prob, _, cls_l), (pks, coords) in zip(meta, results, peaks_coords):
+        if pks is None or not len(pks):
+            continue
+
+        # ── Vectorized margin filter ──────────────────────────────────────────
+        if vm:
+            keep = np.ones(len(pks), dtype=bool)
+            if x0 != 0:           keep &= pks[:, 1] >= vm
+            if x0 + tw < w_slide: keep &= pks[:, 1] < tw - vm
+            if y0 != 0:           keep &= pks[:, 0] >= vm
+            if y0 + th < h_slide: keep &= pks[:, 0] < th - vm
+            pks    = pks[keep]
+            coords = coords[keep]
+            if not len(pks):
+                continue
+
+        # ── Batch logit extraction + softmax ──────────────────────────────────
+        cls_avg    = _uf(cls_l, size=(1, vote_window_px, vote_window_px), mode='nearest')
+        logits_all = cls_avg[:, pks[:, 0], pks[:, 1]]   # (C, N)
+        probs_all  = _softmax(logits_all, axis=0)        # (C, N)
+        raw_ids    = probs_all.argmax(axis=0)            # (N,)
+        cls_ids    = cls_perm[raw_ids] if cls_perm is not None else raw_ids
+        if cls_perm is not None and include_class_probs:
+            probs_all = probs_all[cls_perm]
+
+        # ── Batch polygon rings ───────────────────────────────────────────────
+        rings = np.stack([coords[:, 1, :], coords[:, 0, :]], axis=2)  # (N, n_rays, 2) [x,y]
+        rings = np.concatenate([rings, rings[:, :1, :]], axis=1)       # close ring
+        rings += np.array([x0, y0], dtype=np.float32)
+
+        # ── Dict construction (unavoidably per-nucleus) ───────────────────────
+        for k in range(len(pks)):
+            pr, pc  = int(pks[k, 0]), int(pks[k, 1])
+            cls_id  = int(cls_ids[k])
+            name    = idx2label.get(cls_id, f"class_{cls_id}")
+            feat: dict = {
+                "type": "Feature", "id": "",
+                "geometry": {"type": "Polygon", "coordinates": [rings[k].tolist()]},
+                "properties": {
+                    "classification": {"name": name, "index": cls_id},
+                    "prob_peak": float(prob[pr, pc]),
+                },
+            }
+            if include_class_probs:
+                feat["properties"]["class_probs"] = {
+                    idx2label.get(i, str(i)): float(probs_all[i, k])
+                    for i in range(probs_all.shape[0])
+                }
+            features.append(feat)
+
+    return features
+
+
 def process_tile_batch_v4(
     meta: list[tuple[int, int, int, int]],
     patches: list[np.ndarray],
@@ -747,65 +849,17 @@ def process_tile_batch_v4(
         returning (smaller GeoJSON, faster export).
     """
     if use_fast_vote_class:
-        # Fast path: average logits in a square window instead of polygon interior.
-        from geometry import (  # type: ignore
-            local_peaks,
-            dists_and_coords_from_peaks,
-            polygon_ring_rowcol,
-        )
         _t = time.perf_counter()
         results = forward_batch_with_perm(model, patches, device, fp16=fp16, cls_perm=cls_perm)
         gpu_time = time.perf_counter() - _t
-
-        vm = int(valid_margin) if valid_margin else 0
-        hw = max(1, vote_window_px // 2)
-        features: list[dict] = []
-
-        for (x0, y0, tw, th), (prob, dist_m, cls_l) in zip(meta, results):
-            pks = local_peaks(prob, min_distance=int(nms_dist), thresh=float(prob_thresh))
-            if not len(pks):
-                continue
-            _, coords = dists_and_coords_from_peaks(
-                dist_m, pks, prob,
-                refine_local_com=refine_local_com,
-                refine_radius_px=int(refine_radius_px),
-            )
-            _left   = x0 == 0
-            _top    = y0 == 0
-            _right  = x0 + tw >= w_slide
-            _bottom = y0 + th >= h_slide
-            H_t, W_t = prob.shape
-            for k in range(coords.shape[0]):
-                pr, pc = int(pks[k, 0]), int(pks[k, 1])
-                if vm:
-                    if not _left   and pc < vm:         continue
-                    if not _right  and pc >= tw - vm:   continue
-                    if not _top    and pr < vm:          continue
-                    if not _bottom and pr >= th - vm:    continue
-                r0 = max(0, pr - hw); r1 = min(H_t, pr + hw)
-                c0 = max(0, pc - hw); c1 = min(W_t, pc + hw)
-                logits_win = cls_l[:, r0:r1, c0:c1].mean(axis=(1, 2))
-                import torch as _torch
-                probs_k = _torch.softmax(_torch.from_numpy(logits_win), dim=0).numpy()
-                cls_id = int(probs_k.argmax())
-                if cls_perm is not None:
-                    cls_id = int(cls_perm[cls_id])
-                ring = polygon_ring_rowcol(coords[k]) + np.array([x0, y0], dtype=np.float32)
-                name = idx2label.get(cls_id, f"class_{cls_id}")
-                feat: dict = {
-                    "type": "Feature", "id": "",
-                    "geometry": {"type": "Polygon", "coordinates": [ring.tolist()]},
-                    "properties": {
-                        "classification": {"name": name, "index": int(cls_id)},
-                        "prob_peak": float(prob[pr, pc]),
-                    },
-                }
-                if include_class_probs:
-                    feat["properties"]["class_probs"] = {
-                        idx2label.get(i, str(i)): float(p)
-                        for i, p in enumerate(probs_k)
-                    }
-                features.append(feat)
+        features = postprocess_batch_v4(
+            meta, results,
+            nms_dist=nms_dist, prob_thresh=prob_thresh,
+            refine_local_com=refine_local_com, refine_radius_px=refine_radius_px,
+            valid_margin=valid_margin, w_slide=w_slide, h_slide=h_slide,
+            idx2label=idx2label, cls_perm=cls_perm,
+            vote_window_px=vote_window_px, include_class_probs=include_class_probs,
+        )
         return features, gpu_time
 
     # Standard path — delegate to process_tile_batch

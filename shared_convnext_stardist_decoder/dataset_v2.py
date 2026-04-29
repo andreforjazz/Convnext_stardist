@@ -17,12 +17,14 @@ Changes vs dataset.py (v1):
 from __future__ import annotations
 
 import json
+import random
 from pathlib import Path
 
 import numpy as np
 import torch
 from PIL import Image
 from torch.utils.data import ConcatDataset, Dataset
+import torchvision.transforms.functional as TF
 import tifffile
 
 from .targets import assemble_targets
@@ -96,6 +98,7 @@ class StardistMultitaskTileDatasetV2(Dataset):
         stems: list[str] | None = None,
         cache_to_ram: bool = False,
         cls_only: bool = False,    # Fix #4: skip tiles with no cls supervision
+        augment: bool = False,     # online color jitter (train only)
     ) -> None:
         super().__init__()
         self.images_dir   = Path(images_dir)
@@ -105,6 +108,7 @@ class StardistMultitaskTileDatasetV2(Dataset):
         self.class_to_idx = class_to_idx or {}
         self.cache_to_ram = cache_to_ram
         self.cls_only     = cls_only
+        self.augment      = augment
         self.ram_cache    = {}
         self._bad_inst2class_warn = 0
 
@@ -241,6 +245,16 @@ class StardistMultitaskTileDatasetV2(Dataset):
                 ).astype(np.int32)
             else:
                 inst = np.zeros((ps, ps), dtype=np.int32)
+
+        # ── Online color augmentation (train only, labels unchanged) ──────────
+        if self.augment:
+            img = TF.adjust_brightness(img, random.uniform(0.75, 1.25))
+            img = TF.adjust_contrast(img,   random.uniform(0.75, 1.25))
+            img = TF.adjust_saturation(img, random.uniform(0.80, 1.20))
+            img = TF.adjust_hue(img,        random.uniform(-0.06, 0.06))
+            if random.random() < 0.35:
+                img = TF.gaussian_blur(img, kernel_size=5,
+                                       sigma=random.uniform(0.5, 1.5))
 
         arr          = np.asarray(img, dtype=np.float32) / 255.0
         inst_to_cls  = self._load_inst2class(stem)
