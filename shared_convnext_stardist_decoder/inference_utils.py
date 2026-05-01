@@ -24,10 +24,10 @@ Tile geometry
 
 Classification / geometry
 --------------------------
-    vote_class(cls_log, coords_rc, tile_shape)    -> (cls_id, probs)
-    polygon_ring_rowcol(coords_rc)                 -> np.ndarray (n_rays+1, 2)
     label_color(name, labels_viz, colors_viz)       -> (r, g, b) 0-255
     label_color_float(name, labels_viz, colors_viz) -> float32 [0,1] array
+    (vote_class / polygon_ring_rowcol live in geometry.py — duplicate copies
+     here have been archived to old_codes/legacy_inference_helpers.py.)
 
 GeoJSON export
 --------------
@@ -213,55 +213,10 @@ def batch_forward_fast(
 
 
 # ── Classification voting ─────────────────────────────────────────────────────
-
-def vote_class(
-    cls_log: np.ndarray,
-    coords_rc: np.ndarray,
-    tile_shape: tuple[int, int],
-) -> tuple[int, np.ndarray]:
-    """
-    Assign a class to one nucleus by averaging logits over its polygon footprint.
-
-    Parameters
-    ----------
-    cls_log   : (C, H, W) logit map
-    coords_rc : (n_rays, 2) star-polygon vertex coordinates [row, col]
-    tile_shape: (H, W) of the tile (for clipping)
-
-    Returns
-    -------
-    cls_id : int  argmax class index (0-based)
-    probs  : (C,) float32  softmax probabilities
-    """
-    H, W = tile_shape
-    C = cls_log.shape[0]
-    rows = np.clip(coords_rc[:, 0].astype(np.int64), 0, H - 1)
-    cols = np.clip(coords_rc[:, 1].astype(np.int64), 0, W - 1)
-    mean_logits = cls_log[:, rows, cols].mean(axis=1)        # (C,)
-    e = np.exp(mean_logits - mean_logits.max())
-    probs = (e / e.sum()).astype(np.float32)
-    return int(probs.argmax()), probs
-
-
-# ── Polygon geometry ──────────────────────────────────────────────────────────
-
-def polygon_ring_rowcol(coords_rc: np.ndarray) -> np.ndarray:
-    """
-    Convert star-polygon ray-end coords → closed [col, row] ring for GeoJSON.
-
-    Parameters
-    ----------
-    coords_rc : (n_rays, 2)  [row, col] vertex coordinates
-
-    Returns
-    -------
-    ring : (n_rays+1, 2)  [col, row] with first == last (GeoJSON closed ring)
-    """
-    ring = np.empty((coords_rc.shape[0] + 1, 2), dtype=np.float32)
-    ring[:-1, 0] = coords_rc[:, 1]   # col → x
-    ring[:-1, 1] = coords_rc[:, 0]   # row → y
-    ring[-1]     = ring[0]
-    return ring
+# `vote_class` and `polygon_ring_rowcol` were duplicates of the canonical
+# versions in `geometry.py` (with a conflicting array-shape convention) and
+# have been archived to `old_codes/legacy_inference_helpers.py`.  Use
+# `geometry.vote_class` / `geometry.polygon_ring_rowcol` instead.
 
 
 # ── Colour helpers ────────────────────────────────────────────────────────────
@@ -811,115 +766,13 @@ def postprocess_batch_v4(
     return features
 
 
-def process_tile_batch_v4(
-    meta: list[tuple[int, int, int, int]],
-    patches: list[np.ndarray],
-    model: nn.Module,
-    device: torch.device | str,
-    *,
-    fp16: bool = False,
-    cls_perm: np.ndarray | None = None,
-    nms_dist: int = 8,
-    prob_thresh: float = 0.45,
-    refine_local_com: bool = True,
-    refine_radius_px: int = 8,
-    valid_margin: int = 0,
-    w_slide: int,
-    h_slide: int,
-    idx2label: dict[int, str],
-    # v4 extras
-    use_fast_vote_class: bool = False,
-    vote_window_px: int = 64,
-    include_class_probs: bool = True,
-) -> tuple[list[dict], float]:
-    """
-    v4 wrapper around :func:`process_tile_batch`.
-
-    Extra v4 parameters
-    -------------------
-    use_fast_vote_class
-        If True, average cls logits over a square window around each peak
-        (``vote_window_px × vote_window_px``) rather than the full polygon
-        interior.  Faster but slightly less accurate for large nuclei.
-    vote_window_px
-        Side length of the square averaging window when ``use_fast_vote_class``
-        is True.  Ignored otherwise.
-    include_class_probs
-        If False, strip ``class_probs`` from each feature's properties before
-        returning (smaller GeoJSON, faster export).
-    """
-    if use_fast_vote_class:
-        _t = time.perf_counter()
-        results = forward_batch_with_perm(model, patches, device, fp16=fp16, cls_perm=cls_perm)
-        gpu_time = time.perf_counter() - _t
-        features = postprocess_batch_v4(
-            meta, results,
-            nms_dist=nms_dist, prob_thresh=prob_thresh,
-            refine_local_com=refine_local_com, refine_radius_px=refine_radius_px,
-            valid_margin=valid_margin, w_slide=w_slide, h_slide=h_slide,
-            idx2label=idx2label, cls_perm=cls_perm,
-            vote_window_px=vote_window_px, include_class_probs=include_class_probs,
-        )
-        return features, gpu_time
-
-    # Standard path — delegate to process_tile_batch
-    features, gpu_time = process_tile_batch(
-        meta, patches, model, device,
-        fp16=fp16, cls_perm=cls_perm, nms_dist=nms_dist, prob_thresh=prob_thresh,
-        refine_local_com=refine_local_com, refine_radius_px=refine_radius_px,
-        valid_margin=valid_margin, w_slide=w_slide, h_slide=h_slide,
-        idx2label=idx2label,
-    )
-    if not include_class_probs:
-        for f in features:
-            f["properties"].pop("class_probs", None)
-    return features, gpu_time
-
-
-def write_geojson_feature_collection_v4(
-    path: str | Path,
-    features: list[dict],
-    *,
-    coord_decimals: int | None = 2,
-    gzip_compress: bool = False,
-    use_orjson: bool = False,
-) -> None:
-    """
-    v4 GeoJSON writer.  Identical to :func:`write_geojson_feature_collection`
-    but adds ``use_orjson`` for faster serialisation on large exports.
-
-    Parameters
-    ----------
-    use_orjson
-        If True and ``orjson`` is installed, use it instead of stdlib ``json``
-        (2-4× faster, lower peak memory).  Falls back silently to stdlib if
-        ``orjson`` is not installed.
-    """
-    if use_orjson:
-        try:
-            import orjson  # type: ignore
-
-            path = Path(path)
-            if coord_decimals is not None:
-                feats_out = [feature_with_rounded_geometry(f, coord_decimals) for f in features]
-            else:
-                feats_out = features
-            payload = {"type": "FeatureCollection", "features": feats_out}
-            raw = orjson.dumps(payload)
-            if gzip_compress:
-                with gzip.open(path, "wb") as gz:
-                    gz.write(raw)
-            else:
-                Path(path).write_bytes(raw)
-            return
-        except ImportError:
-            pass  # fall through to stdlib
-
-    write_geojson_feature_collection(
-        path, features,
-        coord_decimals=coord_decimals,
-        gzip_compress=gzip_compress,
-    )
+# `process_tile_batch_v4` and `write_geojson_feature_collection_v4` were
+# vestigial v4 wrappers superseded by the v5.4 pipeline:
+#   - process_tile_batch_v4 → inference_v54.process_tile_batch_v54
+#   - write_geojson_feature_collection_v4 → inference_v54.write_geojson_streaming
+# Both have been archived to `old_codes/legacy_inference_helpers.py`.
+# `postprocess_batch_v4` stays in this module — `eval_classification.ipynb`
+# still imports and calls it.
 
 
 # ── DataLoader tile pipeline (disk-backed WSI; avoids starving the GPU) ───────
