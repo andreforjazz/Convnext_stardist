@@ -176,7 +176,7 @@ def stage_cohort(
     overlap = set(train_stems) & set(val_stems)
     if overlap:
         raise RuntimeError(
-            f"{name}: data leak — {len(overlap)} stems appear in BOTH train and val "
+            f"{name}: data leak -- {len(overlap)} stems appear in BOTH train and val "
             f"CSVs. First 5: {sorted(overlap)[:5]}"
         )
 
@@ -234,13 +234,13 @@ def stage_cohort(
 
     elapsed = time.perf_counter() - t0
     print(
-        f"[{name}] done in {elapsed:.0f}s — "
+        f"[{name}] done in {elapsed:.0f}s -- "
         f"copied={counts['copied']:,} skipped={counts['skipped']:,} "
         f"missing={counts['missing']:,} dryrun={counts['dryrun']:,}  "
         f"{bytes_done/1e9:.2f} GB"
     )
 
-    # Don't hard-fail on missing files — continue to next cohort, record in
+    # Don't hard-fail on missing files -- continue to next cohort, record in
     # manifest, and let the caller decide. Per-cohort exit is signalled at
     # the end of main().
     if counts["missing"] > 0 and not dry_run:
@@ -333,7 +333,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         (args.out / "manifest.json").write_text(
             json.dumps(manifest, indent=2), encoding="utf-8"
         )
-        print(f"\nmanifest → {args.out / 'manifest.json'}")
+        print(f"\nmanifest -> {args.out / 'manifest.json'}")
 
     total_bytes   = sum(c["bytes_copied"]  for c in manifest["cohorts"].values())
     total_files   = sum(c["files_copied"] + c["files_skipped"] for c in manifest["cohorts"].values())

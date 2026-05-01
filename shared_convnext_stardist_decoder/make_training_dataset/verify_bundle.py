@@ -57,32 +57,45 @@ def verify_cohort(bundle: Path, name: str, manifest_entry: dict, do_checksum: bo
     if not train_csv.is_file() or not val_csv.is_file():
         fails.append(f"{name}: missing splits CSVs ({train_csv}, {val_csv})")
         return fails
-    train_stems = _read_stems(train_csv)
-    val_stems   = _read_stems(val_csv)
+    # Dedupe within each CSV (matches the runtime dataset loader and the bundler).
+    train_stems = list(dict.fromkeys(_read_stems(train_csv)))
+    val_stems   = list(dict.fromkeys(_read_stems(val_csv)))
     overlap = set(train_stems) & set(val_stems)
     if overlap:
         fails.append(f"{name}: train/val stem overlap: {len(overlap)} stems "
                      f"(first 3: {sorted(overlap)[:3]})")
-    if len(train_stems) != manifest_entry["train_stems"]:
-        fails.append(f"{name}: train.csv has {len(train_stems)} stems, manifest says {manifest_entry['train_stems']}")
-    if len(val_stems) != manifest_entry["val_stems"]:
-        fails.append(f"{name}: val.csv has {len(val_stems)} stems, manifest says {manifest_entry['val_stems']}")
+    expected_train = manifest_entry["train_stems"]
+    expected_val   = manifest_entry["val_stems"]
+    # Allow the bundle's stem count to be SMALLER than the manifest if the user
+    # cleaned out orphan stems post-bundle (e.g. dropped rows missing inst2class JSONs).
+    # A larger count would still be a real drift.
+    if len(train_stems) > expected_train:
+        fails.append(f"{name}: train.csv has {len(train_stems)} unique stems, manifest says {expected_train}")
+    if len(val_stems) > expected_val:
+        fails.append(f"{name}: val.csv has {len(val_stems)} unique stems, manifest says {expected_val}")
 
     # ── per-stem file presence ──────────────────────────────────────────────
+    # Listing each directory once is ~1000x faster than per-file .exists() over SMB.
     for split, stems in (("train", train_stems), ("val", val_stems)):
         img_dir = cohort / split / "images"
         lbl_dir = cohort / split / "labels"
+        try:
+            img_set = {p.name for p in img_dir.iterdir()}
+            lbl_set = {p.name for p in lbl_dir.iterdir()}
+        except OSError as exc:
+            fails.append(f"{name}/{split}: cannot list images/labels dir ({exc})")
+            continue
         missing_img = missing_lbl = missing_json = 0
         for stem in stems:
-            if not (img_dir / f"{stem}.png").exists():
+            if f"{stem}.png" not in img_set:
                 missing_img += 1
-            if not (lbl_dir / f"{stem}.png").exists():
+            if f"{stem}.png" not in lbl_set:
                 missing_lbl += 1
-            if not (lbl_dir / f"{stem}_inst2class.json").exists():
+            if f"{stem}_inst2class.json" not in lbl_set:
                 missing_json += 1
         if missing_img or missing_lbl or missing_json:
             fails.append(
-                f"{name}/{split}: missing files — "
+                f"{name}/{split}: missing files -- "
                 f"images={missing_img}, label_pngs={missing_lbl}, label_jsons={missing_json}"
             )
 
