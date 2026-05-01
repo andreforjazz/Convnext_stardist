@@ -113,17 +113,22 @@ def need_copy(src: Path, dst: Path, force: bool) -> bool:
         return True
 
 
-def copy_file(src: Path, dst: Path, *, force: bool, dry_run: bool) -> tuple[str, int]:
-    """Returns (status, bytes_copied). status in {copied, skipped, dryrun, missing}."""
+def copy_file(src: Path, dst: Path, *, force: bool, dry_run: bool) -> tuple[str, int, str]:
+    """Returns (status, bytes_copied, src_path).
+
+    status ∈ {copied, skipped, dryrun, missing}; src_path is included so the
+    caller can log which source path was missing without rebuilding it.
+    """
+    src_str = str(src)
     if not src.exists():
-        return ("missing", 0)
+        return ("missing", 0, src_str)
     if not need_copy(src, dst, force):
-        return ("skipped", 0)
+        return ("skipped", 0, src_str)
     if dry_run:
-        return ("dryrun", src.stat().st_size)
+        return ("dryrun", src.stat().st_size, src_str)
     dst.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(src, dst)
-    return ("copied", dst.stat().st_size)
+    return ("copied", dst.stat().st_size, src_str)
 
 
 def sha256_file(p: Path, chunk: int = 1 << 20) -> str:
@@ -158,8 +163,16 @@ def stage_cohort(
     if not train_csv.is_file() or not val_csv.is_file():
         raise FileNotFoundError(f"{name}: missing split CSVs at {train_csv} / {val_csv}")
 
-    train_stems = read_stem_csv(train_csv)
-    val_stems   = read_stem_csv(val_csv)
+    # Dedupe within each CSV (some pipelines duplicate rows).
+    train_stems_raw = read_stem_csv(train_csv)
+    val_stems_raw   = read_stem_csv(val_csv)
+    train_stems = list(dict.fromkeys(train_stems_raw))
+    val_stems   = list(dict.fromkeys(val_stems_raw))
+    n_train_dupes = len(train_stems_raw) - len(train_stems)
+    n_val_dupes   = len(val_stems_raw)   - len(val_stems)
+    if n_train_dupes or n_val_dupes:
+        print(f"[{name}] CSV duplicates removed: train={n_train_dupes}, val={n_val_dupes}")
+
     overlap = set(train_stems) & set(val_stems)
     if overlap:
         raise RuntimeError(
@@ -191,6 +204,7 @@ def stage_cohort(
 
     # ── Execute the plan in a thread pool (SMB copy is I/O-bound) ───────────
     counts = {"copied": 0, "skipped": 0, "dryrun": 0, "missing": 0}
+    missing_paths: list[str] = []
     bytes_done = 0
     t0 = time.perf_counter()
     last_print = t0
@@ -201,9 +215,11 @@ def stage_cohort(
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = [pool.submit(_do, pair) for pair in plan]
         for i, fut in enumerate(as_completed(futures)):
-            status, nbytes = fut.result()
+            status, nbytes, src_str = fut.result()
             counts[status] += 1
             bytes_done += nbytes
+            if status == "missing":
+                missing_paths.append(src_str)
             now = time.perf_counter()
             if now - last_print > 5:  # every 5 s
                 done = sum(counts.values())
@@ -224,11 +240,16 @@ def stage_cohort(
         f"{bytes_done/1e9:.2f} GB"
     )
 
+    # Don't hard-fail on missing files — continue to next cohort, record in
+    # manifest, and let the caller decide. Per-cohort exit is signalled at
+    # the end of main().
     if counts["missing"] > 0 and not dry_run:
-        raise RuntimeError(
-            f"{name}: {counts['missing']} expected source files were missing — "
-            f"the bundle is incomplete. Investigate before training."
-        )
+        print(f"[{name}] WARNING: {counts['missing']} source files missing. "
+              f"First 10:")
+        for p in missing_paths[:10]:
+            print(f"    {p}")
+        if len(missing_paths) > 10:
+            print(f"    ... and {len(missing_paths) - 10} more")
 
     # ── Optional: SHA-256 of N random sample stems for transport-verify ─────
     sample_hashes: dict[str, str] = {}
@@ -252,6 +273,7 @@ def stage_cohort(
         "files_copied":   counts["copied"],
         "files_skipped":  counts["skipped"],
         "files_missing":  counts["missing"],
+        "missing_paths":  missing_paths,
         "bytes_copied":   bytes_done,
         "elapsed_seconds": round(elapsed, 1),
         "sha256_sample":  sample_hashes,
@@ -313,10 +335,12 @@ def main(argv: Iterable[str] | None = None) -> int:
         )
         print(f"\nmanifest → {args.out / 'manifest.json'}")
 
-    total_bytes = sum(c["bytes_copied"] for c in manifest["cohorts"].values())
-    total_files = sum(c["files_copied"] + c["files_skipped"] for c in manifest["cohorts"].values())
-    print(f"\nTOTAL: {total_files:,} files in scope, {total_bytes/1e9:.1f} GB copied")
-    return 0
+    total_bytes   = sum(c["bytes_copied"]  for c in manifest["cohorts"].values())
+    total_files   = sum(c["files_copied"] + c["files_skipped"] for c in manifest["cohorts"].values())
+    total_missing = sum(c["files_missing"] for c in manifest["cohorts"].values())
+    print(f"\nTOTAL: {total_files:,} files in scope, {total_bytes/1e9:.1f} GB copied, "
+          f"{total_missing} missing source files")
+    return 1 if total_missing > 0 else 0
 
 
 if __name__ == "__main__":
