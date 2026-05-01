@@ -66,14 +66,16 @@ _IMAGENET_STD  = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
 def _import_build_model_v2():
     """Import build_model_v2; ensure repo root is on sys.path (Jupyter-friendly)."""
     try:
-        from shared_convnext_stardist_decoder.model_v2 import build_model_v2
+        from shared_convnext_stardist_decoder.aux_codes.model_v2 import build_model_v2
     except ModuleNotFoundError:
         # Notebook kernels often cwd != repo root and the package is not installed.
-        repo_root = Path(__file__).resolve().parent.parent
+        # __file__ = .../shared_convnext_stardist_decoder/aux_codes/inference_utils.py
+        # parents[2] = repo root (one above the package).
+        repo_root = Path(__file__).resolve().parents[2]
         r = str(repo_root)
         if r not in sys.path:
             sys.path.insert(0, r)
-        from shared_convnext_stardist_decoder.model_v2 import build_model_v2
+        from shared_convnext_stardist_decoder.aux_codes.model_v2 import build_model_v2
     return build_model_v2
 
 
