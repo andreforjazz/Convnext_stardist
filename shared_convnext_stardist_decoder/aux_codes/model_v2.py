@@ -37,6 +37,30 @@ class ConvBlock(nn.Module):
         return self.conv(x)
 
 
+# Stage output channels per ConvNeXt V2 variant. Used to size the decoder skip
+# connections and the cls semantic-skip projection. Add an entry here if you
+# train with a new backbone, or rely on the HF-config fallback below.
+_BACKBONE_STAGE_CHANNELS: dict[str, list[int]] = {
+    "facebook/convnextv2-tiny-22k-224":  [96, 192, 384, 768],
+    "facebook/convnextv2-base-22k-224":  [128, 256, 512, 1024],
+    "facebook/convnextv2-large-22k-224": [192, 384, 768, 1536],
+}
+
+
+def _stage_channels(backbone_name: str, backbone_module) -> list[int]:
+    """Return the 4 stage-output channel widths for the loaded backbone."""
+    if backbone_name in _BACKBONE_STAGE_CHANNELS:
+        return list(_BACKBONE_STAGE_CHANNELS[backbone_name])
+    hidden_sizes = getattr(getattr(backbone_module, "config", None), "hidden_sizes", None)
+    if hidden_sizes is not None and len(hidden_sizes) == 4:
+        return list(hidden_sizes)
+    raise ValueError(
+        f"Unknown backbone {backbone_name!r}: cannot determine stage channels. "
+        f"Either add it to _BACKBONE_STAGE_CHANNELS in model_v2.py, or ensure "
+        f"the backbone exposes `config.hidden_sizes` with 4 values."
+    )
+
+
 class StardistMultitaskNetV2(nn.Module):
     """
     ConvNeXt V2 encoder + UNet segmentation decoder + semantic-skip cls head.
@@ -75,7 +99,7 @@ class StardistMultitaskNetV2(nn.Module):
                 AutoConfig.from_pretrained(backbone_name)
             )
 
-        ch = [96, 192, 384, 768]   # ConvNeXt V2 Tiny stage channels
+        ch = _stage_channels(backbone_name, self.backbone)
         dc = int(decoder_channels)
         S  = int(cls_semantic_dim)
 
