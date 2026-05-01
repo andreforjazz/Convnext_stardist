@@ -21,7 +21,26 @@ The class named `spleen2` (index 18) is actually the **SPLEEN**.
 This must be renamed (`gonad` / `spleen`) before public release across:
   config class_names, CODA label mapping, LABELS_VIZ in inference notebooks, CLAUDE.md.
 
-## Architecture (model_v2.py)
+## Repo layout (post-reorg, 2026-04)
+```
+shared_convnext_stardist_decoder/
+├── train_v2.py                  # entrypoint: python -m shared_convnext_stardist_decoder.train_v2
+├── __init__.py                  # re-exports build_model_v2, StardistMultitaskNetV2
+├── aux_codes/                   # importable modules (model, dataset, losses, helpers)
+│   ├── model_v2.py, dataset_v2.py, targets.py, losses_v2.py, geometry.py
+│   ├── train_utils.py           # used by training notebooks
+│   ├── inference_utils.py, inference_v54.py  # used by inference notebooks
+│   └── __init__.py
+├── configs/                     # YAML configs (training + finetune)
+├── notebooks_train/             # training notebooks (3 files)
+├── notebooks_infer/             # inference + evaluation notebooks (2 files)
+├── make_training_dataset/       # tile extraction pipeline (per-cohort)
+└── old_codes/                   # archived v1 code, do not use
+```
+Notebooks add the repo root to `sys.path` in a bootstrap cell, then import via
+package-qualified path: `from shared_convnext_stardist_decoder.aux_codes.train_utils import …`.
+
+## Architecture (aux_codes/model_v2.py)
 - Backbone: ConvNeXt-V2-Tiny (facebook/convnextv2-tiny-22k-224, ~28M params)
   - Stage channels: [96, 192, 384, 768]; outputs at H/4, H/8, H/16, H/32
 - Decoder: UNet, 128ch, 5 progressive upsamplings with encoder skip connections
@@ -34,19 +53,19 @@ This must be renamed (`gonad` / `spleen`) before public release across:
 - Key params: n_rays=32, num_classes=19, decoder_channels=128, cls_semantic_dim=128,
   head_cls_layers=2
 
-## Loss (losses_v2.py)
+## Loss (aux_codes/losses_v2.py)
 total = 2.0×BCE + 0.15×dist_L1(fg) + 1.0×(cls_pixel_CE + 0.25×cls_inst_CE)
 - cls_inst_CE: scatter-average logits over each instance mask → CE; matches vote_class() at inference
 - class_weights: inv_sqrt_freq, normalized to mean=1.0 (computed from inst2class JSONs)
 
-## Training (train_v2.py + train_utils.py)
+## Training (train_v2.py + aux_codes/train_utils.py)
 - 256×256 patches, batch=8, AdamW lr=5e-5, weight_decay=0.03, AMP, grad_clip=1.0
 - CosineAnnealingLR over unfrozen epochs (T_max=epochs−freeze_backbone_epochs)
 - freeze_backbone_epochs=10 (main) / 0 (finetune) — backbone frozen first N epochs
 - cls_balanced_sampler: WeightedRandomSampler 2× weight for tiles with cls supervision
 - Logs: train_log.csv; checkpoints: best.pt + epoch_XXX.pt
 
-## Dataset (dataset_v2.py + targets.py)
+## Dataset (aux_codes/dataset_v2.py + aux_codes/targets.py)
 - Multi-root: GS40 (~38k train tiles) + GS55 (~16k train tiles)
 - Labels: uint16 instance masks + _inst2class.json sidecars {inst_id: tissue_name}
 - Targets per tile: EDT prob map, star-polygon distances (ray marching or stardist C++),
@@ -55,7 +74,7 @@ total = 2.0×BCE + 0.15×dist_L1(fg) + 1.0×(cls_pixel_CE + 0.25×cls_inst_CE)
   (NOT online during training — tiles are pre-augmented on disk)
 - ImageNet normalization: mean=(0.485,0.456,0.406), std=(0.229,0.224,0.225)
 
-## Inference (inference_utils.py + geometry.py)
+## Inference (aux_codes/inference_utils.py + aux_codes/inference_v54.py + aux_codes/geometry.py)
 - WSI tiling: configurable tile_size + overlap, stride=tile_size−overlap
 - Batch forward: pad to 32× multiple, FP16 optional, unpad after
 - Post-process per tile: local_peaks → ray sampling → polygon vertices → vote_class
@@ -72,23 +91,27 @@ total = 2.0×BCE + 0.15×dist_L1(fg) + 1.0×(cls_pixel_CE + 0.25×cls_inst_CE)
 - Stage 2: Tile extraction with 4-tier class-balanced sampling + 8-fold augmentation
   → uint16 instance masks + inst2class JSON sidecars
 
-## Config files
-- config_gs40_gs55_multitask.yaml  — main training (35 epochs, freeze 10, lr 5e-5→1e-6)
-  experiment: convnext_stardist_mt_gs40_gs55_v2_cls2L_skip128
-- config_finetune_gs40_gs55.yaml   — fine-tune from best.pt (15 epochs, freeze 0, lr 1e-5→1e-7)
-  experiment: convnext_stardist_mt_gs40_gs55_v2_finetune
-- config_gs40_multitask.yaml       — GS40-only baseline
+## Config files (all in `configs/`)
+- configs/config_gs40_gs55_multitask.yaml      — main training (35 epochs, freeze 10, lr 5e-5→1e-6)
+- configs/config_finetune_gs40_gs55.yaml       — fine-tune from best.pt (15 epochs, freeze 0)
+- configs/config_gs40_gs55_gs33_multitask.yaml — main training, all 3 cohorts
+- configs/config_finetune_gs40_gs55_gs33.yaml  — finetune, all 3 cohorts
+- configs/config_gs40_multitask.yaml           — GS40-only baseline
+- configs/config_finetune_gs40.yaml            — GS40-only finetune
+
+Configs are written by the training notebooks (`notebooks_train/`); edit the
+PARAMETERS cell in the notebook rather than hand-editing the YAML.
 
 ## Key train commands
 ```bash
-# Full training
+# Full training (paths now under configs/)
 python -m shared_convnext_stardist_decoder.train_v2 \
-  --config shared_convnext_stardist_decoder/config_gs40_gs55_multitask.yaml
+  --config shared_convnext_stardist_decoder/configs/config_gs40_gs55_gs33_multitask.yaml
 
 # Fine-tune from best checkpoint
 python -m shared_convnext_stardist_decoder.train_v2 \
-  --config shared_convnext_stardist_decoder/config_finetune_gs40_gs55.yaml \
-  --resume <out_dir>/convnext_stardist_mt_gs40_gs55_v2_cls2L_skip128/best.pt
+  --config shared_convnext_stardist_decoder/configs/config_finetune_gs40_gs55_gs33.yaml \
+  --resume <out_dir>/convnext_stardist_mt_gs40_gs55_gs33_v4/best.pt
 ```
 
 ## Evaluation

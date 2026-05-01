@@ -40,15 +40,15 @@ import yaml
 from torch.utils.data import DataLoader, WeightedRandomSampler
 from tqdm import tqdm
 
-from .dataset_v2 import (
+from .aux_codes.dataset_v2 import (
     ConcatStardistMultitaskDatasetV2,
     StardistMultitaskTileDatasetV2,
     build_class_to_idx_from_dir,
     compute_class_weights,
     compute_class_weights_from_dirs,
 )
-from .losses_v2 import multitask_loss_v2
-from .model_v2 import build_model_v2, load_v1_weights_into_v2
+from .aux_codes.losses_v2 import multitask_loss_v2
+from .aux_codes.model_v2 import build_model_v2, load_v1_weights_into_v2
 
 
 def load_config(path: Path) -> dict:
